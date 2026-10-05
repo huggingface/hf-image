@@ -59,11 +59,7 @@ class Builder:
 
     @classmethod
     def detect(cls, args: list[str]) -> Builder:
-        named = (
-            next((args[i + 1] for i, a in enumerate(args[:-1]) if a == "--builder"), None)
-            or next((a.removeprefix("--builder=") for a in args if a.startswith("--builder=")), None)
-            or os.environ.get("BUILDX_BUILDER")
-        )
+        named = option(args, "--builder") or os.environ.get("BUILDX_BUILDER")
         inspect = ["buildx", "inspect", "--bootstrap", *([named] if named else [])]
         return cls.parse(output(inspect, "docker buildx inspect"))
 
@@ -84,6 +80,13 @@ class Builder:
         raise click.ClickException(
             f"the {driver} builder driver is not supported: use the docker driver or a docker-container builder"
         )
+
+
+def option(args: list[str], name: str) -> str | None:
+    """The value of `--name value` or `--name=value` in a docker command line."""
+    return next((args[i + 1] for i, a in enumerate(args[:-1]) if a == name), None) or next(
+        (a.removeprefix(f"{name}=") for a in args if a.startswith(f"{name}=")), None
+    )
 
 
 def full_name(name: str) -> str:

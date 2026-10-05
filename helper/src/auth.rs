@@ -19,7 +19,8 @@ pub struct Tokens {
     http: reqwest::Client,
     base: String,
     hf_token: Option<String>,
-    challenge: Mutex<Option<Challenge>>,
+    /// The registry's bearer challenge once probed: `None` when `/v2/` needs no token.
+    challenge: Mutex<Option<Option<Challenge>>>,
     cache: Mutex<HashMap<String, (String, Instant)>>,
 }
 
@@ -69,21 +70,23 @@ impl Tokens {
     }
 
     async fn challenge(&self) -> anyhow::Result<Option<Challenge>> {
-        if let Some(c) = self.challenge.lock().await.clone() {
-            return Ok(Some(c));
+        let mut cached = self.challenge.lock().await;
+        if let Some(c) = &*cached {
+            return Ok(c.clone());
         }
         let resp = self.http.get(format!("{}/v2/", self.base)).send().await.context("registry unreachable")?;
-        if resp.status() != StatusCode::UNAUTHORIZED {
-            return Ok(None);
-        }
-        let header = resp
-            .headers()
-            .get(reqwest::header::WWW_AUTHENTICATE)
-            .and_then(|v| v.to_str().ok())
-            .context("401 without a WWW-Authenticate challenge")?;
-        let ch = parse_challenge(header).context("unsupported WWW-Authenticate challenge")?;
-        *self.challenge.lock().await = Some(ch.clone());
-        Ok(Some(ch))
+        let ch = if resp.status() == StatusCode::UNAUTHORIZED {
+            let header = resp
+                .headers()
+                .get(reqwest::header::WWW_AUTHENTICATE)
+                .and_then(|v| v.to_str().ok())
+                .context("401 without a WWW-Authenticate challenge")?;
+            Some(parse_challenge(header).context("unsupported WWW-Authenticate challenge")?)
+        } else {
+            None
+        };
+        *cached = Some(ch.clone());
+        Ok(ch)
     }
 }
 

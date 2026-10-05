@@ -50,11 +50,6 @@ impl Platform {
         Ok(Self::new(parts[0], parts[1], parts.get(2).copied()))
     }
 
-    /// The platform this machine runs, in OCI terms.
-    pub fn host() -> Self {
-        Self::new("linux", std::env::consts::ARCH, None)
-    }
-
     /// A normalized platform (uname and Debian arch names accepted).
     pub fn new(os: &str, arch: &str, variant: Option<&str>) -> Self {
         let p = Self {
@@ -136,6 +131,19 @@ pub struct Descriptor {
     pub platform: Option<Platform>,
     #[serde(flatten)]
     pub extra: BTreeMap<String, serde_json::Value>,
+}
+
+impl Descriptor {
+    pub fn new(media_type: &str, digest: &str, size: u64) -> Self {
+        Self {
+            media_type: media_type.into(),
+            digest: digest.into(),
+            size,
+            annotations: None,
+            platform: None,
+            extra: BTreeMap::new(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

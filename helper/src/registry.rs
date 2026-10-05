@@ -14,7 +14,8 @@ use crate::reference::ImageRef;
 
 #[derive(Debug, Clone)]
 pub struct BlobInfo {
-    pub size: u64,
+    /// `None` when the registry sends no `Content-Length`.
+    pub size: Option<u64>,
     pub xet_hash: Option<String>,
 }
 
@@ -138,36 +139,26 @@ impl Registry {
         let h = resp.headers();
         let size = h.get(header::CONTENT_LENGTH).and_then(|v| v.to_str().ok()).and_then(|v| v.parse().ok());
         let xet_hash = h.get("x-xet-hash").and_then(|v| v.to_str().ok()).map(str::to_string);
-        Ok(Some(BlobInfo { size: size.unwrap_or_default(), xet_hash }))
+        Ok(Some(BlobInfo { size, xet_hash }))
     }
 
-    /// A small blob (configs, attestations), through the registry redirect.
-    pub async fn fetch_blob(&self, digest: &str) -> anyhow::Result<Bytes> {
+    /// `GET` of a blob, following the registry's redirect to a signed URL when it sends one.
+    pub async fn download(&self, digest: &str) -> anyhow::Result<Response> {
         let url = self.url(&format!("/blobs/{digest}"));
         let resp = self.send(|c| c.get(&url)).await?;
-        let resp = match resp.status() {
-            s if s.is_redirection() => {
-                let loc = resp.headers().get(header::LOCATION).and_then(|v| v.to_str().ok()).context("redirect")?;
-                let loc = reqwest::Url::parse(&url)?.join(loc)?;
-                check(self.download.get(loc).send().await?, "blob download").await?
-            }
-            _ => check(resp, "blob download").await?,
-        };
-        let bytes = resp.bytes().await?;
+        if !resp.status().is_redirection() {
+            return check(resp, "blob download").await;
+        }
+        check(self.download.get(redirect(&url, &resp)?).send().await?, "blob download").await
+    }
+
+    /// A small blob (configs, attestations), checked against its digest.
+    pub async fn fetch_blob(&self, digest: &str) -> anyhow::Result<Bytes> {
+        let bytes = self.download(digest).await?.bytes().await?;
         if sha256(&bytes) != digest {
             bail!("blob {digest} does not match its digest");
         }
         Ok(bytes)
-    }
-
-    /// Monolithic upload of an in-memory blob.
-    pub async fn upload_blob(&self, digest: &str, bytes: Bytes) -> anyhow::Result<()> {
-        let url = self.url(&format!("/blobs/uploads/?digest={digest}"));
-        let resp = self
-            .send(|c| c.post(&url).header(header::CONTENT_TYPE, "application/octet-stream").body(bytes.clone()))
-            .await?;
-        check(resp, "blob upload").await?;
-        Ok(())
     }
 
     /// A CAS token for the repo, reused until two minutes before it expires.
@@ -210,8 +201,7 @@ impl Registry {
             check(resp, "blob download").await?;
             bail!("blob {digest}: expected a redirect");
         }
-        let loc = resp.headers().get(header::LOCATION).and_then(|v| v.to_str().ok()).context("redirect")?;
-        Ok(reqwest::Url::parse(&url)?.join(loc)?.to_string())
+        Ok(redirect(&url, &resp)?.to_string())
     }
 
     /// Raw request against the repository (the local gateway proxies manifests with it).
@@ -225,6 +215,12 @@ impl Registry {
         let url = self.url(suffix);
         self.send(|c| c.request(method.clone(), &url).headers(headers.clone()).body(body.clone())).await
     }
+}
+
+/// The absolute `Location` of a redirect from `url`.
+fn redirect(url: &str, resp: &Response) -> anyhow::Result<reqwest::Url> {
+    let loc = resp.headers().get(header::LOCATION).and_then(|v| v.to_str().ok()).context("redirect")?;
+    Ok(reqwest::Url::parse(url)?.join(loc)?)
 }
 
 async fn check(resp: Response, what: &str) -> anyhow::Result<Response> {

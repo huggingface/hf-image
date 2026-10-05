@@ -106,6 +106,11 @@ def test_run(hfi):
     assert run["args"] == ["run", *args]
 
 
+def test_run_pulls_the_platform_it_runs(hfi):
+    _, (helper, _) = hfi("run", "--platform=linux/amd64", "cr.hf.co/a/b:v1", "--platform", "x")
+    assert op(helper) == ["pull", "cr.hf.co/a/b:v1", "--platform", "linux/amd64", "--if-stale"]
+
+
 def test_run_needs_an_image(hfi):
     done, calls = hfi("run", "--rm", "busybox")
     assert done.returncode == 1 and "no <registry>/<namespace>/<name> image" in done.stderr

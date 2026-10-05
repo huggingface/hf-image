@@ -16,7 +16,7 @@ from .docker import Builder, Daemon
 from .helper import LAYOUT, Failed, Helper, Layout
 from .reference import ImageRef
 
-BUILD_FLAGS = ("--push", "--load", "--output", "-o", "--tag")
+BUILD_FLAGS = ("--push", "--load", "--output", "-o")
 """`docker buildx build` flags that `hf image build` sets."""
 PASSTHROUGH = {"ignore_unknown_options": True, "allow_interspersed_args": False}
 
@@ -63,7 +63,7 @@ def build(token: str | None, tag: str, args: tuple[str, ...]) -> None:
             "compression=uncompressed,force-compression=true,oci-mediatypes=true"
         )
         code = docker.run(["buildx", "build", *args, "--output", output])
-        summary = json.loads("".join(helper.stop()))
+        summary = helper.result(helper.stop())
     if code != 0:
         raise click.ClickException(f"docker buildx build failed (exit code {code})")
     digest = next((d for r, d in reversed(summary["pushed"]) if r == image.tag_or_latest()), None)
@@ -134,11 +134,13 @@ def pull(token: str | None, image: str, platform: str | None, output: Path | Non
 @click.pass_obj
 def run(token: str | None, args: tuple[str, ...]) -> None:
     """`docker run`, pulling first (fast) when the local image is missing or stale."""
-    image = next((r for a in args if not a.startswith("-") and (r := parse_or_none(a))), None)
-    if image is None:
+    at = next((i for i, a in enumerate(args) if not a.startswith("-") and parse_or_none(a)), None)
+    if at is None:
         raise click.ClickException("no <registry>/<namespace>/<name> image in the arguments")
+    image = ImageRef.parse(args[at])
     daemon = Daemon.detect()
-    Helper(daemon).run(["pull", str(image), "--platform", daemon.platform, "--if-stale"], hf_token(token))
+    platform = docker.option(list(args[:at]), "--platform") or daemon.platform
+    Helper(daemon).run(["pull", str(image), "--platform", platform, "--if-stale"], hf_token(token))
     sys.stdout.flush()
     sys.stderr.flush()
     os.execvp("docker", ["docker", "run", *args])

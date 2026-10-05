@@ -12,26 +12,26 @@ use bytes::Bytes;
 use futures::StreamExt;
 use tokio::io::AsyncReadExt;
 
-use crate::containerd::{Containerd, Store, descriptor};
+use crate::containerd::Containerd;
 use crate::oci::{self, Descriptor, Index, Manifest, Platform, chain_ids, diff_ids, is_index};
 use crate::reference::ImageRef;
-use crate::registry::Registry;
+use crate::registry::{BlobInfo, Registry};
 use crate::util::{self, xet_stream};
 use crate::xet::{Downloader, Xet};
 
 pub struct PullOpts {
     pub image: ImageRef,
     pub token: Option<String>,
-    /// `os/arch[/variant]`; default: this machine's platform.
-    pub platform: Option<String>,
+    pub platform: Platform,
     pub target: Target,
-    /// Keeps a local image that is current, or that the registry does not have.
+    /// Keeps a local image that is current, that the registry does not have, or that it cannot
+    /// be asked about.
     pub if_stale: bool,
 }
 
 /// Where a pull writes.
 pub enum Target {
-    Store(Store),
+    Store(Containerd),
     Layout(PathBuf),
 }
 
@@ -45,32 +45,36 @@ struct Resolved {
 }
 
 /// Returns the image's digest.
-pub async fn pull(opts: &PullOpts) -> anyhow::Result<String> {
+pub async fn pull(opts: PullOpts) -> anyhow::Result<String> {
     let start = Instant::now();
     let registry = Registry::new(&opts.image, opts.token.clone(), false)?;
-    let platform = match &opts.platform {
-        Some(p) => Platform::parse(p)?,
-        None => Platform::host(),
-    };
     let name = local_name(&opts.image);
     if opts.if_stale
-        && let Target::Store(store) = &opts.target
+        && let Target::Store(cd) = &opts.target
     {
-        let (cd, reference) = (store.connect().await?, opts.image.reference());
-        let (local, remote) = tokio::try_join!(cd.image(&name), registry.manifest(&reference))?;
-        if let Some(local) = local
-            && remote.is_none_or(|r| r.digest == local.digest)
-        {
-            return Ok(local.digest);
+        let reference = opts.image.reference();
+        let (local, remote) = tokio::join!(cd.image(&name), registry.manifest(&reference));
+        if let Some(local) = local? {
+            let current = match remote {
+                Ok(Some(r)) => r.digest == local.digest,
+                Ok(None) => true,
+                Err(e) => {
+                    tracing::warn!("{e:#}: running the local image");
+                    true
+                }
+            };
+            if current {
+                return Ok(local.digest);
+            }
         }
     }
     let xet = Xet::new(registry.clone())?;
     // Independent round trips, overlapped.
-    let (resolved, downloader) = tokio::try_join!(resolve(&registry, &opts.image, &platform), xet.downloader())?;
+    let (resolved, downloader) = tokio::try_join!(resolve(&registry, &opts.image, &opts.platform), xet.downloader())?;
     let downloader = Arc::new(downloader);
-    let (layers, fetched) = match &opts.target {
-        Target::Layout(dir) => into_layout(dir, &registry, &downloader, &opts.image, &resolved).await?,
-        Target::Store(store) => into_containerd(store, &registry, &downloader, &opts.image, &resolved).await?,
+    let (layers, fetched) = match opts.target {
+        Target::Layout(dir) => into_layout(&dir, &registry, &downloader, &opts.image, &resolved).await?,
+        Target::Store(cd) => into_containerd(cd, &registry, &downloader, &opts.image, &resolved).await?,
     };
     let layer_bytes = resolved.manifest.layers.iter().map(|l| l.size).sum();
     eprintln!(
@@ -96,7 +100,7 @@ fn short(digest: &str) -> &str {
 async fn resolve(registry: &Registry, image: &ImageRef, platform: &Platform) -> anyhow::Result<Resolved> {
     let top = registry.manifest(&image.reference()).await?.with_context(|| format!("{image} not found"))?;
     let top_type = media_type(&top.media_type, &top.bytes);
-    let top_desc = desc(&top_type, &top.digest, top.bytes.len() as u64);
+    let top_desc = Descriptor::new(&top_type, &top.digest, top.bytes.len() as u64);
     let (manifest_desc, manifest_bytes) = if is_index(&top_type) {
         let index: Index = serde_json::from_slice(&top.bytes).context("invalid image index")?;
         let child = index.select(platform).with_context(|| format!("{image} has no {platform} image"))?;
@@ -124,41 +128,35 @@ fn media_type(header: &str, bytes: &[u8]) -> String {
     }
 }
 
-fn desc(media_type: &str, digest: &str, size: u64) -> oci::Descriptor {
-    oci::Descriptor {
-        media_type: media_type.into(),
-        digest: digest.into(),
-        size,
-        annotations: None,
-        platform: None,
-        extra: Default::default(),
-    }
+/// The registry's `HEAD` of a layer.
+async fn layer_info(registry: &Registry, layer: &Descriptor) -> anyhow::Result<BlobInfo> {
+    registry.blob(&layer.digest).await?.with_context(|| format!("layer {} is missing", layer.digest))
 }
 
+/// A layer's bytes: from Xet when the registry stores it there, else from the registry.
 async fn layer_stream(
     registry: &Registry,
     downloader: &Downloader,
     layer: &Descriptor,
+    info: BlobInfo,
 ) -> anyhow::Result<futures::stream::BoxStream<'static, anyhow::Result<Bytes>>> {
-    let info = registry.blob(&layer.digest).await?.with_context(|| format!("layer {} is missing", layer.digest))?;
     match info.xet_hash {
         Some(h) => Ok(xet_stream(downloader.stream(&h, layer.size).await?).boxed()),
         None => {
-            let loc = registry.blob_location(&layer.digest).await?;
-            let resp = reqwest::get(loc).await?.error_for_status()?;
+            let resp = registry.download(&layer.digest).await?;
             Ok(resp.bytes_stream().map(|r| r.map_err(anyhow::Error::from)).boxed())
         }
     }
 }
 
 async fn into_containerd(
-    store: &Store,
+    cd: Containerd,
     registry: &Arc<Registry>,
     downloader: &Arc<Downloader>,
     image: &ImageRef,
     r: &Resolved,
 ) -> anyhow::Result<(usize, usize)> {
-    let cd = Arc::new(store.connect().await?.leased().await?);
+    let cd = Arc::new(cd.leased().await?);
     let result = write_image(&cd, registry, downloader, image, r).await;
     cd.release().await;
     result
@@ -193,7 +191,8 @@ async fn write_image(
             if layer.digest != diff {
                 labels.insert("containerd.io/uncompressed".into(), diff.clone());
             }
-            let stream = layer_stream(&registry, &downloader, &layer).await?;
+            let info = layer_info(&registry, &layer).await?;
+            let stream = layer_stream(&registry, &downloader, &layer, info).await?;
             cd.write(&layer.digest, layer.size, labels, stream).await?;
             Ok(true)
         }));
@@ -203,7 +202,7 @@ async fn write_image(
     for (i, (fetch, layer)) in fetches.into_iter().zip(&r.manifest.layers).enumerate() {
         fetched += usize::from(fetch.await??);
         let parent = i.checked_sub(1).map(|p| chains[p].as_str());
-        cd.unpack(&descriptor(&layer.media_type, &layer.digest, layer.size), &diffs[i], &chains[i], parent).await?;
+        cd.unpack(&layer.into(), &diffs[i], &chains[i], parent).await?;
     }
 
     let sn_label = format!("containerd.io/gc.ref.snapshot.{}", cd.snapshotter);
@@ -224,7 +223,7 @@ async fn write_image(
         let labels = HashMap::from([("containerd.io/gc.ref.content.m.0".to_string(), r.manifest_desc.digest.clone())]);
         cd.put(&r.top.digest, r.top_bytes.clone(), labels).await?;
     }
-    cd.put_image(&local_name(image), descriptor(&r.top.media_type, &r.top.digest, r.top.size)).await?;
+    cd.put_image(&local_name(image), (&r.top).into()).await?;
     Ok((r.manifest.layers.len(), fetched))
 }
 
@@ -248,14 +247,13 @@ async fn into_layout(
             if tokio::fs::try_exists(&target).await? {
                 return anyhow::Ok(false);
             }
-            let info =
-                registry.blob(&layer.digest).await?.with_context(|| format!("layer {} is missing", layer.digest))?;
+            let info = layer_info(&registry, &layer).await?;
             let partial = target.with_extension("partial");
             match info.xet_hash {
                 Some(h) => downloader.to_file(&h, layer.size, &partial).await?,
                 None => {
                     let mut out = tokio::fs::File::create(&partial).await?;
-                    let mut s = layer_stream(&registry, &downloader, &layer).await?;
+                    let mut s = registry.download(&layer.digest).await?.bytes_stream();
                     while let Some(b) = s.next().await {
                         tokio::io::AsyncWriteExt::write_all(&mut out, &b?).await?;
                     }

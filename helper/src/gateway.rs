@@ -60,9 +60,9 @@ struct Session {
 /// Blobs uploaded since the last manifest push.
 #[derive(Default)]
 struct Batch {
-    uploader: Option<Arc<Uploader>>,
+    uploader: Option<Uploader>,
     pending: HashMap<String, Registration>,
-    /// File uploads started in `uploader` and not finished yet.
+    /// File uploads started in `uploader` and neither finished nor abandoned.
     in_flight: usize,
 }
 
@@ -130,7 +130,7 @@ impl Gateway {
     async fn start_file(&self, size: Option<u64>) -> anyhow::Result<FileUpload> {
         let mut b = self.batch.lock().await;
         if b.uploader.is_none() {
-            b.uploader = Some(Arc::new(self.xet.uploader().await?));
+            b.uploader = Some(self.xet.uploader().await?);
         }
         let file = b.uploader.as_ref().expect("opened").file("blob", size)?;
         b.in_flight += 1;
@@ -144,6 +144,14 @@ impl Gateway {
             b.pending.insert(r.digest.clone(), r);
         }
         self.idle.notify_waiters();
+    }
+
+    /// Drops a session's upload and frees its slot in the batch.
+    async fn abandon(&self, session: &Arc<Mutex<Session>>) {
+        self.uploads.lock().await.retain(|_, s| !Arc::ptr_eq(s, session));
+        if session.lock().await.upload.take().is_some() {
+            self.end_file(None).await;
+        }
     }
 
     async fn pending_size(&self, digest: &str) -> Option<u64> {
@@ -164,7 +172,6 @@ impl Gateway {
             idle.await;
         };
         let Some(uploader) = uploader else { return Ok(()) };
-        let uploader = Arc::try_unwrap(uploader).map_err(|_| anyhow::anyhow!("upload session still in use"))?;
         uploader.finalize().await?;
         let registrations: Vec<Registration> = pending.into_values().collect();
         if !registrations.is_empty() {
@@ -212,7 +219,7 @@ async fn blob(
     match gw.registry.blob(&digest).await {
         Ok(Some(info)) if method == Method::HEAD => {
             gw.stats.blobs_skipped.fetch_add(1, Ordering::Relaxed);
-            exists(info.size)
+            exists(info.size.unwrap_or_default())
         }
         Ok(Some(_)) => match gw.registry.blob_location(&digest).await {
             Ok(loc) => (StatusCode::TEMPORARY_REDIRECT, [(header::LOCATION, loc)]).into_response(),
@@ -283,8 +290,10 @@ fn created(gw: &Gateway, ns: &str, name: &str, digest: &str) -> Response {
         .into_response()
 }
 
-/// Appends a request body to a session, starting its Xet upload on the first bytes.
-async fn feed(gw: &Gateway, session: &Arc<Mutex<Session>>, body: Body) -> anyhow::Result<u64> {
+/// Appends a request body to a session, starting its Xet upload on the first bytes. A body that
+/// fails or stops early (the client went away) abandons the session.
+async fn feed(gw: &Arc<Gateway>, session: &Arc<Mutex<Session>>, body: Body) -> anyhow::Result<u64> {
+    let mut feeding = Feeding { gw: gw.clone(), session: session.clone(), done: false };
     let mut s = session.lock().await;
     let mut stream = body.into_data_stream();
     while let Some(chunk) = stream.next().await {
@@ -296,7 +305,24 @@ async fn feed(gw: &Gateway, session: &Arc<Mutex<Session>>, body: Body) -> anyhow
         s.size += chunk.len() as u64;
         s.upload.as_mut().expect("started").write(chunk).await?;
     }
+    feeding.done = true;
     Ok(s.size)
+}
+
+/// Abandons the session when dropped before the body was fed to its end.
+struct Feeding {
+    gw: Arc<Gateway>,
+    session: Arc<Mutex<Session>>,
+    done: bool,
+}
+
+impl Drop for Feeding {
+    fn drop(&mut self) {
+        if !self.done {
+            let (gw, session) = (self.gw.clone(), self.session.clone());
+            tokio::spawn(async move { gw.abandon(&session).await });
+        }
+    }
 }
 
 async fn session(gw: &Gateway, id: &str) -> Option<Arc<Mutex<Session>>> {

@@ -12,6 +12,7 @@ use tokio::io::{AsyncBufReadExt, BufReader, Lines};
 
 use crate::containerd::Store;
 use crate::gateway::Gateway;
+use crate::oci::Platform;
 use crate::pull::{PullOpts, Target, pull};
 use crate::push::{Origin, PushOpts, push};
 use crate::reference::ImageRef;
@@ -54,12 +55,12 @@ impl Op {
             Op::Pull { image, platform, if_stale, output, owner } => {
                 let target = match &output {
                     Some(dir) => Target::Layout(dir.clone()),
-                    None => Target::Store(Self::store(store)?),
+                    None => Target::Store(Self::store(store)?.connect().await?),
                 };
-                let opts =
-                    PullOpts { image: ImageRef::parse(&image)?, token, platform: Some(platform), target, if_stale };
+                let (image, platform) = (ImageRef::parse(&image)?, Platform::parse(&platform)?);
+                let opts = PullOpts { image, token, platform, target, if_stale };
                 let pulled = tokio::select! {
-                    digest = pull(&opts) => digest,
+                    digest = pull(opts) => digest,
                     () = host.stopped() => Err(anyhow!("stopped")),
                 };
                 // Partial pulls too: they leave blobs a later pull reuses.

@@ -17,13 +17,15 @@ use containerd_client::services::v1::snapshots::{
 };
 use containerd_client::services::v1::{
     ApplyRequest, CreateImageRequest, CreateRequest, DeleteRequest, GetImageRequest, Image, Info, InfoRequest,
-    ReadContentRequest, UpdateImageRequest, UpdateRequest, WriteAction, WriteContentRequest,
+    ReadContentRequest, UpdateImageRequest, WriteAction, WriteContentRequest,
 };
 use containerd_client::types::Descriptor;
 use futures::{Stream, StreamExt};
 use tokio::sync::mpsc;
 use tonic::transport::Channel;
 use tonic::{Code, Request};
+
+use crate::oci;
 
 const MAX_MESSAGE: usize = 1 << 20;
 const LEASE_TTL: Duration = Duration::from_secs(2 * 3600);
@@ -51,9 +53,8 @@ pub struct Containerd {
 
 impl Containerd {
     pub async fn connect(address: &str, namespace: &str, snapshotter: &str) -> anyhow::Result<Self> {
-        let path = address.strip_prefix("unix://").unwrap_or(address);
-        let channel = containerd_client::connect(path).await.with_context(|| {
-            format!("cannot reach containerd at {path} (is Docker using the containerd image store?)")
+        let channel = containerd_client::connect(address).await.with_context(|| {
+            format!("cannot reach containerd at {address} (is Docker using the containerd image store?)")
         })?;
         Ok(Self { channel, namespace: namespace.into(), snapshotter: snapshotter.into(), lease: None })
     }
@@ -122,15 +123,6 @@ impl Containerd {
         Ok(stream.map(|r| r.map(|m| Bytes::from(m.data)).map_err(anyhow::Error::from)))
     }
 
-    pub async fn read_all(&self, digest: &str) -> anyhow::Result<Bytes> {
-        let mut out = Vec::new();
-        let mut s = std::pin::pin!(self.read(digest).await?);
-        while let Some(b) = s.next().await {
-            out.extend_from_slice(&b?);
-        }
-        Ok(out.into())
-    }
-
     /// Writes content from a stream; containerd verifies digest and size on commit. Content that
     /// already exists is left as is.
     pub async fn write(
@@ -165,14 +157,14 @@ impl Containerd {
         });
         let mut offset = 0u64;
         let mut data = std::pin::pin!(data);
-        while let Some(chunk) = data.next().await {
+        'send: while let Some(chunk) = data.next().await {
             let chunk = chunk?;
             for piece in chunk.chunks(MAX_MESSAGE) {
                 let mut m = request(WriteAction::Write, offset);
                 m.data = piece.to_vec();
                 offset += piece.len() as u64;
                 if tx.send(m).await.is_err() {
-                    break;
+                    break 'send;
                 }
             }
         }
@@ -192,15 +184,6 @@ impl Containerd {
     pub async fn put(&self, digest: &str, bytes: Bytes, labels: HashMap<String, String>) -> anyhow::Result<()> {
         let size = bytes.len() as u64;
         self.write(digest, size, labels, futures::stream::iter([Ok(bytes)])).await
-    }
-
-    /// Adds labels to existing content.
-    pub async fn label(&self, digest: &str, labels: HashMap<String, String>) -> anyhow::Result<()> {
-        let paths = labels.keys().map(|k| format!("labels.{k}")).collect();
-        let info = Info { digest: digest.into(), labels, ..Default::default() };
-        let req = UpdateRequest { info: Some(info), update_mask: Some(prost_types::FieldMask { paths }) };
-        ContentClient::new(self.channel.clone()).update(self.req(req)).await?;
-        Ok(())
     }
 
     pub async fn snapshot_exists(&self, key: &str) -> anyhow::Result<bool> {
@@ -261,23 +244,22 @@ impl Containerd {
     }
 }
 
-pub fn descriptor(media_type: &str, digest: &str, size: u64) -> Descriptor {
-    Descriptor { media_type: media_type.into(), digest: digest.into(), size: size as i64, annotations: HashMap::new() }
+impl From<&oci::Descriptor> for Descriptor {
+    fn from(d: &oci::Descriptor) -> Self {
+        Self {
+            media_type: d.media_type.clone(),
+            digest: d.digest.clone(),
+            size: d.size as i64,
+            annotations: HashMap::new(),
+        }
+    }
 }
 
+/// RFC 3339 to the second, as `containerd.io/gc.expire` wants it.
 fn rfc3339(t: SystemTime) -> String {
-    let secs = t.duration_since(SystemTime::UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or_default();
-    let (days, rem) = (secs.div_euclid(86_400), secs.rem_euclid(86_400));
-    let z = days + 719_468;
-    let era = z.div_euclid(146_097);
-    let doe = z - era * 146_097;
-    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let d = doy - (153 * mp + 2) / 5 + 1;
-    let m = if mp < 10 { mp + 3 } else { mp - 9 };
-    let y = yoe + era * 400 + i64::from(m <= 2);
-    format!("{y:04}-{m:02}-{d:02}T{:02}:{:02}:{:02}Z", rem / 3600, rem / 60 % 60, rem % 60)
+    let mut ts = prost_types::Timestamp::from(t);
+    ts.nanos = 0;
+    ts.to_string()
 }
 
 #[cfg(test)]

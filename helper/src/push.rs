@@ -387,7 +387,7 @@ impl Ctx<'_> {
             return Ok(size);
         }
         if let Some(existing) = self.registry.blob(diff_id).await? {
-            return Ok(existing.size);
+            return existing.size.with_context(|| format!("the registry gave no size for layer {diff_id}"));
         }
         let stream = self.source.read(&layer.digest).await?;
         let upload = self.uploader.file(diff_id, None)?;
@@ -406,7 +406,7 @@ impl Ctx<'_> {
 
 /// Decompresses a layer (gzip, zstd or plain tar, by magic) into an upload, hashing the tar.
 /// Returns (tar digest, tar size, bytes read, upload).
-pub async fn decode_into(
+async fn decode_into(
     mut stream: BoxStream<'static, anyhow::Result<Bytes>>,
     mut upload: FileUpload,
 ) -> anyhow::Result<(String, u64, u64, crate::xet::Uploaded)> {
@@ -452,17 +452,20 @@ pub async fn decode_into(
         drop(in_tx);
         anyhow::Ok(read)
     };
-    let drain = async {
+    // Owns `out_rx`: a failed upload closes the channel, which stops the decoder, then `feed`.
+    let up = &mut upload;
+    let drain = async move {
         while let Some(b) = out_rx.recv().await {
-            upload.write(b).await?;
+            up.write(b).await?;
         }
         anyhow::Ok(())
     };
     let (read, drained) = tokio::join!(feed, drain);
+    let read = read?;
     drained?;
     let (digest, size) = decoder.await??;
     let done = upload.finish().await?;
-    Ok((digest, size, read?, done))
+    Ok((digest, size, read, done))
 }
 
 fn read_up_to(r: &mut impl Read, buf: &mut [u8]) -> std::io::Result<usize> {
