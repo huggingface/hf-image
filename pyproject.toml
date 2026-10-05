@@ -1,6 +1,6 @@
 [project]
 name = "hf-image"
-version = "0.2.2"
+version = "0.2.3"
 description = "Fast build, push, pull and run of container images on the Hugging Face registry"
 readme = "README.md"
 requires-python = ">=3.10"
