@@ -1,0 +1,39 @@
+[package]
+name = "hf-image-helper"
+version = "0.2.0"
+edition = "2024"
+rust-version = "1.89"
+publish = false
+description = "The data plane of `hf image`: Xet transfers, containerd and the build endpoint, next to the Docker daemon"
+
+[dependencies]
+anyhow = "1"
+async-trait = "0.1"
+axum = "0.8"
+base64 = "0.23"
+bytes = "1"
+clap = { version = "4", features = ["derive", "env"] }
+containerd-client = "0.9"
+flate2 = { version = "1", default-features = false, features = ["zlib-rs"] }
+futures = "0.3"
+hex = "0.4"
+prost-types = "0.14"
+reqwest = { version = "0.13", default-features = false, features = ["json", "rustls", "stream", "query", "http2"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.11"
+thiserror = "2"
+tokio = { version = "1", features = ["fs", "io-std", "io-util", "macros", "net", "process", "rt-multi-thread", "sync", "time"] }
+tonic = "0.14"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+url = "2"
+uuid = { version = "1", features = ["v4"] }
+xet-client = "1"
+xet-data = "1"
+xet-runtime = "1"
+zstd = "0.14"
+
+[profile.release]
+lto = "thin"
+codegen-units = 4
