@@ -15,7 +15,7 @@ from pathlib import Path
 import click
 
 from ._pin import HELPER_IMAGE
-from .docker import Daemon
+from .docker import Daemon, anonymous, image_exists
 
 CACHE_VOLUME = "hf-image-cache"
 """Named volume holding the Xet caches (`HF_IMAGE_CACHE_VOLUME` overrides)."""
@@ -80,15 +80,25 @@ class Helper:
             cmd += ["--containerd", CONTAINERD_SOCKET, "--namespace", d.namespace, "--snapshotter", d.snapshotter]
         return cmd + op
 
+    def fetch(self) -> None:
+        """Pulls the pinned image without credentials when missing: it is public, and a stale login is refused."""
+        if self.image != HELPER_IMAGE or image_exists(self.image):
+            return
+        click.echo(f"Pulling the helper image {self.image.split('@')[0]}", err=True)
+        with anonymous() as env:
+            # On failure, `docker run` pulls it with the user's credentials and reports why.
+            subprocess.run(["docker", "pull", "-q", self.image], env=env, capture_output=True)
+
     def start(self, op: list[str], token: str | None, layout: Layout | None = None) -> Running:
         """Starts `op` and hands it the token."""
         try:
+            self.fetch()
             proc = subprocess.Popen(
                 self.command(op, layout), stdin=subprocess.PIPE, stdout=subprocess.PIPE, encoding="utf-8"
             )
         except FileNotFoundError as e:
             raise click.ClickException("failed to run docker (is Docker installed?)") from e
-        running = Running(proc, self.image)
+        running = Running(proc)
         running.send(token or "")
         return running
 
@@ -101,9 +111,8 @@ class Helper:
 class Running:
     """A helper container at work; leaving its `with` block stops it."""
 
-    def __init__(self, proc: subprocess.Popen, image: str):
+    def __init__(self, proc: subprocess.Popen):
         self.proc = proc
-        self.image = image
 
     def __enter__(self) -> Running:
         return self
@@ -161,10 +170,7 @@ class Running:
         if code == 0:
             return
         if code == 125:
-            raise click.ClickException(
-                f"could not start the helper container {self.image} "
-                "(HF_IMAGE_HELPER_IMAGE selects another, scripts/helper-image.sh builds one)"
-            )
+            raise click.ClickException("Docker could not start the helper container: see its error above")
         if code < 0:
             raise click.ClickException("the helper container was killed")
         raise Failed(code)

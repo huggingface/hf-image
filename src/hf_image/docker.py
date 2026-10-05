@@ -6,7 +6,11 @@ import itertools
 import json
 import os
 import subprocess
+import tempfile
+from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass
+from pathlib import Path
 
 import click
 
@@ -127,3 +131,19 @@ def image_exists(name: str) -> bool:
 def run(args: list[str]) -> int:
     """Runs `docker <args>` with inherited stdio; returns its exit code."""
     return subprocess.call(["docker", *args])
+
+
+@contextmanager
+def anonymous() -> Iterator[dict[str, str]]:
+    """An environment where the `docker` CLI sends no registry credentials, on the same context."""
+    user = Path(os.environ.get("DOCKER_CONFIG") or Path.home() / ".docker")
+    try:
+        config = json.loads((user / "config.json").read_text())
+    except (OSError, ValueError):
+        config = {}
+    context = config.get("currentContext") if isinstance(config, dict) else None
+    with tempfile.TemporaryDirectory(prefix="hf-image-docker-") as tmp:
+        (Path(tmp) / "config.json").write_text(json.dumps({"currentContext": context} if context else {}))
+        if (user / "contexts").is_dir():
+            (Path(tmp) / "contexts").symlink_to(user / "contexts")
+        yield {**os.environ, "DOCKER_CONFIG": tmp}
