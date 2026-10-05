@@ -1,0 +1,36 @@
+[project]
+name = "hf-image"
+version = "0.2.0"
+description = "Fast build, push, pull and run of container images on the Hugging Face registry"
+readme = "README.md"
+requires-python = ">=3.10"
+license = "Apache-2.0"
+dependencies = ["click>=8.1", "huggingface_hub>=1.0"]
+
+[project.urls]
+Repository = "https://github.com/huggingface/hf-image"
+
+# The hf CLI runs the console script named hf-<name> as `hf <name>`.
+[project.scripts]
+hf-image = "hf_image.cli:main"
+
+[dependency-groups]
+dev = ["pytest>=8", "ruff>=0.6"]
+
+[build-system]
+requires = ["hatchling>=1.26"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/hf_image"]
+
+[tool.ruff]
+line-length = 120
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
+
+[tool.ruff.lint.per-file-ignores]
+# The release writes the pinned image reference, digest included, on one line.
+"src/hf_image/_pin.py" = ["E501"]
