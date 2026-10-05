@@ -172,7 +172,16 @@ impl Registry {
         let url = self.url(&format!("/_hf/xet-token?op={}", if write { "write" } else { "read" }));
         let resp = self.send(|c| c.get(&url)).await?;
         if resp.status() == StatusCode::NOT_FOUND || resp.status() == StatusCode::BAD_REQUEST {
-            bail!("this registry does not support Xet transfers (no _hf/xet-token endpoint)");
+            let body = resp.text().await.unwrap_or_default();
+            if let Some((code, message)) = oci_error(&body)
+                && code == "NAME_UNKNOWN"
+            {
+                if message.is_empty() {
+                    bail!("repository {} does not exist", self.repo);
+                }
+                bail!("{message}");
+            }
+            bail!("this registry does not support Xet transfers");
         }
         let t: CasToken = check(resp, "Xet token").await?.json().await?;
         self.cas_tokens.lock().await.insert(write, t.clone());
@@ -229,9 +238,57 @@ async fn check(resp: Response, what: &str) -> anyhow::Result<Response> {
     }
     let status = resp.status();
     let body = resp.text().await.unwrap_or_default();
-    let message = serde_json::from_str::<serde_json::Value>(&body)
-        .ok()
-        .and_then(|v| v["errors"][0]["message"].as_str().map(str::to_string))
-        .unwrap_or(body);
+    let message = oci_error(&body).map(|(_, m)| m).filter(|m| !m.is_empty()).unwrap_or(body);
     bail!("{what}: {status}: {}", message.trim())
+}
+
+/// Code and message of the first error in an OCI error body.
+fn oci_error(body: &str) -> Option<(String, String)> {
+    let v: serde_json::Value = serde_json::from_str(body).ok()?;
+    let e = v["errors"].get(0)?;
+    let field = |k: &str| e[k].as_str().unwrap_or_default().trim().to_string();
+    Some((field("code"), field("message")))
+}
+
+#[cfg(test)]
+mod tests {
+    use axum::Router;
+    use axum::routing::get;
+
+    use super::*;
+
+    /// A loopback registry whose `_hf/xet-token` answers `status` with `body`.
+    async fn registry(status: StatusCode, body: &'static str) -> Arc<Registry> {
+        let app = Router::new()
+            .route("/v2/", get(|| async { StatusCode::OK }))
+            .route("/v2/{ns}/{name}/_hf/xet-token", get(move || async move { (status, body) }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        Registry::new(&ImageRef::parse(&format!("{addr}/acme/app")).unwrap(), None, true).unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_missing_repo_gets_the_registry_message() {
+        let body = r#"{"errors":[{"code":"NAME_UNKNOWN","message":"container repository acme/app does not exist, create it on the Hugging Face Hub first"}]}"#;
+        let err = registry(StatusCode::NOT_FOUND, body).await.xet_token(true).await.unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "container repository acme/app does not exist, create it on the Hugging Face Hub first"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_registry_without_xet_says_so() {
+        let err = registry(StatusCode::NOT_FOUND, "404 page not found").await.xet_token(true).await.unwrap_err();
+        assert!(err.to_string().contains("does not support Xet transfers"), "{err}");
+    }
+
+    #[test]
+    fn oci_errors_are_parsed() {
+        let body = r#"{"errors":[{"code":"DENIED","message":" no push access "}]}"#;
+        assert_eq!(oci_error(body), Some(("DENIED".into(), "no push access".into())));
+        assert_eq!(oci_error("not json"), None);
+        assert_eq!(oci_error(r#"{"errors":[]}"#), None);
+    }
 }

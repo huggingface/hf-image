@@ -83,6 +83,8 @@ impl Op {
             }
             Op::Serve { image } => {
                 let registry = Registry::new(&ImageRef::parse(&image)?, token, true)?;
+                // Fails before the build when the repo is missing or not writable.
+                registry.xet_token(true).await?;
                 let gw = Gateway::new(registry.clone(), Xet::new(registry)?);
                 let (endpoint, serving) = gw.serve(SocketAddr::from((Ipv4Addr::LOCALHOST, 0))).await?;
                 println!("{}", serde_json::to_string(&endpoint)?);
