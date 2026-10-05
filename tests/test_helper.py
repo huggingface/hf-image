@@ -1,11 +1,14 @@
+import re
 from pathlib import Path
 
 import pytest
 
+from hf_image._pin import HELPER_IMAGE
 from hf_image.docker import Daemon
 from hf_image.helper import Helper, Layout
 
 DAEMON = Daemon("/run/containerd/containerd.sock", "moby", "overlayfs", "linux/arm64", rootless=False)
+ROOT = Path(__file__).parent.parent
 
 
 @pytest.fixture(autouse=True)
@@ -54,3 +57,10 @@ def test_layout_owner(monkeypatch):
     assert Layout.owner(Daemon(**{**DAEMON.__dict__, "rootless": True})) is None
     monkeypatch.setattr("sys.platform", "darwin")
     assert Layout.owner(DAEMON) is None
+
+
+def test_versions_and_pin_agree():
+    """pyproject.toml, helper/Cargo.toml and the pinned helper image carry the same version."""
+    version = re.search(r'^version = "(.+)"$', (ROOT / "pyproject.toml").read_text(), re.M)[1]
+    assert re.search(r'^version = "(.+)"$', (ROOT / "helper/Cargo.toml").read_text(), re.M)[1] == version
+    assert re.fullmatch(rf"[^@]+:{re.escape(version)}@sha256:[0-9a-f]{{64}}", HELPER_IMAGE), HELPER_IMAGE

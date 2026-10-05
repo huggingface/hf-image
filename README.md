@@ -86,8 +86,8 @@ $ export HF_IMAGE_HELPER_IMAGE=hf-image-helper:dev
 $ scripts/dev-install.sh                                                 # `hf image` runs this checkout
 ```
 
-`pyproject.toml` and `helper/Cargo.toml` carry the same version. A `vX.Y.Z` tag publishes the helper
-image and pushes a branch that pins it by digest; merging that branch releases the version.
+`scripts/release.sh X.Y.Z` bumps the version, publishes its helper image (the Release workflow),
+pins it by digest and opens the PR: merging that PR releases the version.
 
 ## License
 
