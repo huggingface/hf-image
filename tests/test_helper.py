@@ -1,11 +1,14 @@
+import io
+import json
 import re
 from pathlib import Path
 
+import click
 import pytest
 
 from hf_image._pin import HELPER_IMAGE
 from hf_image.docker import Daemon
-from hf_image.helper import Helper, Layout
+from hf_image.helper import Helper, Layout, Running
 
 DAEMON = Daemon("/run/containerd/containerd.sock", "moby", "overlayfs", "linux/arm64", rootless=False)
 ROOT = Path(__file__).parent.parent
@@ -64,3 +67,52 @@ def test_versions_and_pin_agree():
     version = re.search(r'^version = "(.+)"$', (ROOT / "pyproject.toml").read_text(), re.M)[1]
     assert re.search(r'^version = "(.+)"$', (ROOT / "helper/Cargo.toml").read_text(), re.M)[1] == version
     assert re.fullmatch(rf"[^@]+:{re.escape(version)}@sha256:[0-9a-f]{{64}}", HELPER_IMAGE), HELPER_IMAGE
+
+
+def test_fetch_pulls_the_pinned_image_without_credentials(monkeypatch, tmp_path: Path):
+    monkeypatch.delenv("HF_IMAGE_HELPER_IMAGE")
+    user = tmp_path / "docker"
+    (user / "contexts" / "meta").mkdir(parents=True)
+    config = {"currentContext": "desktop-linux", "auths": {"cr.hf.co": {"auth": "c3RhbGU6c3RhbGU="}}}
+    (user / "config.json").write_text(json.dumps(config))
+    monkeypatch.setenv("DOCKER_CONFIG", str(user))
+    monkeypatch.setattr("hf_image.helper.image_exists", lambda name: False)
+    seen = {}
+
+    def run(cmd, env, **kwargs):
+        anon = Path(env["DOCKER_CONFIG"])
+        seen.update(cmd=cmd, config=json.loads((anon / "config.json").read_text()))
+        seen["contexts"] = (anon / "contexts").resolve()
+
+    monkeypatch.setattr("hf_image.helper.subprocess.run", run)
+    Helper(DAEMON).fetch()
+    assert seen["cmd"] == ["docker", "pull", "-q", HELPER_IMAGE]
+    assert seen["config"] == {"currentContext": "desktop-linux"}
+    assert seen["contexts"] == (user / "contexts").resolve()
+
+
+def test_fetch_leaves_local_and_overridden_images(monkeypatch):
+    calls = []
+    monkeypatch.setattr("hf_image.helper.subprocess.run", lambda *a, **k: calls.append(a))
+    Helper(DAEMON).fetch()
+    monkeypatch.delenv("HF_IMAGE_HELPER_IMAGE")
+    monkeypatch.setattr("hf_image.helper.image_exists", lambda name: True)
+    Helper(DAEMON).fetch()
+    assert calls == []
+
+
+class Exited:
+    """A `docker run` that has exited with `code`."""
+
+    def __init__(self, code: int):
+        self.code = code
+        self.stdin = io.StringIO()
+
+    def wait(self, timeout=None) -> int:
+        return self.code
+
+
+def test_docker_failing_to_start_the_container():
+    message = r"^Docker could not start the helper container: see its error above$"
+    with pytest.raises(click.ClickException, match=message):
+        Running(Exited(125)).exit()

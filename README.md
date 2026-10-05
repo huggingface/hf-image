@@ -60,8 +60,9 @@ its logs.
 - For `build`: the `docker` builder driver, or a `docker-container` builder.
 - A Hugging Face token with access to the image's repository: `hf auth login`, `HF_TOKEN`, or
   `--token`.
-- The helper image, pulled on first use: `cr.hf.co/infra-workloads/hf-image-helper` (public,
-  linux/amd64 and linux/arm64), pinned by digest for each version.
+- The helper image, pulled on first use without registry credentials:
+  `cr.hf.co/infra-workloads/hf-image-helper` (public, linux/amd64 and linux/arm64), pinned by digest
+  for each version.
 
 ## Configuration
 
