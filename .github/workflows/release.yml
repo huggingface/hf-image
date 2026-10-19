@@ -78,7 +78,8 @@ jobs:
           path: helper-context
       # Artifacts drop the executable bit.
       - run: chmod +x helper-context/hf-image-helper-*
-      # The registry ignores the user name: the token is the credential.
+      # The registry ignores the user name: the token is the credential. HF_IMAGE_HELPER_TOKEN belongs
+      # to a service account of the infra-workloads org.
       - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
         with:
           registry: cr.hf.co
