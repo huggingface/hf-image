@@ -146,6 +146,19 @@ def run(token: str | None, args: tuple[str, ...]) -> None:
     os.execvp("docker", ["docker", "run", *args])
 
 
+@cli.command()
+@click.argument("image")
+@click.pass_obj
+def delete(token: str | None, image: str) -> None:
+    """Delete the image a tag or digest names from the registry, with every tag on it."""
+    ref = ImageRef.parse(image)
+    if not ref.tag and not ref.digest:
+        raise click.ClickException(f"{image}: name the tag or digest to delete")
+    digest = Helper(Daemon.detect()).run(["delete", str(ref)], hf_token(token))["digest"]
+    click.echo(f"deleted {ref.registry}/{ref.repo}@{digest} and its tags", err=True)
+    click.echo(digest)
+
+
 def parse_or_none(s: str) -> ImageRef | None:
     try:
         return ImageRef.parse(s)

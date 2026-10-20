@@ -128,6 +128,13 @@ impl Registry {
         Ok(sha256(bytes))
     }
 
+    /// Deletes a manifest by digest, with every tag on it.
+    pub async fn delete_manifest(&self, digest: &str) -> anyhow::Result<()> {
+        let url = self.url(&format!("/manifests/{digest}"));
+        check(self.send(|c| c.delete(&url)).await?, "manifest delete").await?;
+        Ok(())
+    }
+
     /// `HEAD` of a blob: its size and, on the Hugging Face registry, its Xet hash.
     pub async fn blob(&self, digest: &str) -> anyhow::Result<Option<BlobInfo>> {
         let url = self.url(&format!("/blobs/{digest}"));
@@ -253,19 +260,22 @@ fn oci_error(body: &str) -> Option<(String, String)> {
 #[cfg(test)]
 mod tests {
     use axum::Router;
-    use axum::routing::get;
+    use axum::routing::{delete, get};
 
     use super::*;
 
-    /// A loopback registry whose `_hf/xet-token` answers `status` with `body`.
-    async fn registry(status: StatusCode, body: &'static str) -> Arc<Registry> {
-        let app = Router::new()
-            .route("/v2/", get(|| async { StatusCode::OK }))
-            .route("/v2/{ns}/{name}/_hf/xet-token", get(move || async move { (status, body) }));
+    /// A client of `app`, served on loopback as an anonymous registry.
+    async fn serve(app: Router) -> Arc<Registry> {
+        let app = app.route("/v2/", get(|| async { StatusCode::OK }));
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
         Registry::new(&ImageRef::parse(&format!("{addr}/acme/app")).unwrap(), None, true).unwrap()
+    }
+
+    /// A loopback registry whose `_hf/xet-token` answers `status` with `body`.
+    async fn registry(status: StatusCode, body: &'static str) -> Arc<Registry> {
+        serve(Router::new().route("/v2/{ns}/{name}/_hf/xet-token", get(move || async move { (status, body) }))).await
     }
 
     #[tokio::test]
@@ -282,6 +292,20 @@ mod tests {
     async fn a_registry_without_xet_says_so() {
         let err = registry(StatusCode::NOT_FOUND, "404 page not found").await.xet_token(true).await.unwrap_err();
         assert!(err.to_string().contains("does not support Xet transfers"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn a_refused_delete_gets_the_registry_message() {
+        let body = r#"{"errors":[{"code":"UNSUPPORTED","message":"manifest sha256:a is referenced by index sha256:b, delete the index first"}]}"#;
+        let app = Router::new().route(
+            "/v2/{ns}/{name}/manifests/{reference}",
+            delete(move || async move { (StatusCode::BAD_REQUEST, body) }),
+        );
+        let err = serve(app).await.delete_manifest("sha256:a").await.unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "manifest delete: 400 Bad Request: manifest sha256:a is referenced by index sha256:b, delete the index first"
+        );
     }
 
     #[test]

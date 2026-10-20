@@ -117,6 +117,21 @@ def test_run_needs_an_image(hfi):
     assert calls == []
 
 
+def test_delete(hfi):
+    done, (helper,) = hfi("delete", "cr.hf.co/a/b:v1")
+    assert (done.returncode, done.stdout) == (0, f"{DIGEST}\n"), done.stderr
+    assert done.stderr == f"deleted cr.hf.co/a/b@{DIGEST} and its tags\n"
+    assert op(helper) == ["delete", "cr.hf.co/a/b:v1"]
+    _, (helper,) = hfi("delete", f"cr.hf.co/a/b@{DIGEST}")
+    assert op(helper) == ["delete", f"cr.hf.co/a/b@{DIGEST}"]
+
+
+def test_delete_needs_a_tag_or_digest(hfi):
+    done, calls = hfi("delete", "cr.hf.co/a/b")
+    assert done.returncode == 1 and "name the tag or digest to delete" in done.stderr
+    assert calls == []
+
+
 def test_build(hfi):
     done, (serve, build) = hfi("build", "-t", "cr.hf.co/a/b:v1", "--build-arg", "X=1", "ctx")
     assert (done.returncode, done.stdout) == (0, f"{BUILT}\n"), done.stderr

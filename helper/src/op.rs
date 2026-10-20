@@ -44,6 +44,8 @@ pub enum Op {
     },
     /// Serves the build endpoint on loopback; prints its `Endpoint`, then its `Summary` once stopped.
     Serve { image: String },
+    /// Deletes the image a tag or digest names, with every tag on it; prints its digest.
+    Delete { image: String },
 }
 
 impl Op {
@@ -91,6 +93,14 @@ impl Op {
                 host.stopped().await;
                 serving.abort();
                 println!("{}", serde_json::to_string(&gw.summary().await)?);
+            }
+            Op::Delete { image } => {
+                let image = ImageRef::parse(&image)?;
+                let registry = Registry::new(&image, token, true)?;
+                let manifest =
+                    registry.manifest(&image.reference()).await?.with_context(|| format!("{image} not found"))?;
+                registry.delete_manifest(&manifest.digest).await?;
+                Self::print_digest(&manifest.digest);
             }
         }
         Ok(())
