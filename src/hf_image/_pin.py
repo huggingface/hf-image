@@ -1,2 +1,2 @@
 # The helper image this version runs, pinned by digest by scripts/release.sh.
-HELPER_IMAGE = "cr.hf.co/infra-workloads/hf-image-helper:0.2.3@sha256:44562ec893f4c0ce034b0c018cea3ce7689c686bceb1476a47cd485d234ac07f"
+HELPER_IMAGE = "cr.hf.co/infra-workloads/hf-image-helper:0.3.0@sha256:fdb07a0135d56635b59b1c9612ca9f824a2c8e4c99c45d484ada271c5cb481e3"
