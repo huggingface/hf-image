@@ -150,12 +150,25 @@ def run(token: str | None, args: tuple[str, ...]) -> None:
 @click.argument("image")
 @click.pass_obj
 def delete(token: str | None, image: str) -> None:
-    """Delete the image a tag or digest names from the registry, with every tag on it."""
+    """Delete an image from the registry by digest, once no tag references it."""
     ref = ImageRef.parse(image)
-    if not ref.tag and not ref.digest:
-        raise click.ClickException(f"{image}: name the tag or digest to delete")
+    if not ref.digest:
+        raise click.ClickException(f"{image}: delete takes a digest (remove tags with hf image untag)")
     digest = Helper(Daemon.detect()).run(["delete", str(ref)], hf_token(token))["digest"]
-    click.echo(f"deleted {ref.registry}/{ref.repo}@{digest} and its tags", err=True)
+    click.echo(f"deleted {ref.registry}/{ref.repo}@{digest}", err=True)
+    click.echo(digest)
+
+
+@cli.command()
+@click.argument("image")
+@click.pass_obj
+def untag(token: str | None, image: str) -> None:
+    """Remove a tag from the registry; the image stays, by digest, until deleted."""
+    ref = ImageRef.parse(image)
+    if not ref.tag or ref.digest:
+        raise click.ClickException(f"{image}: expected <registry>/<namespace>/<name>:<tag>")
+    digest = Helper(Daemon.detect()).run(["untag", str(ref)], hf_token(token))["digest"]
+    click.echo(f"untagged {ref.tagged()}; the image stays as {ref.registry}/{ref.repo}@{digest}", err=True)
     click.echo(digest)
 
 

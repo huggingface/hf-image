@@ -128,10 +128,10 @@ impl Registry {
         Ok(sha256(bytes))
     }
 
-    /// Deletes a manifest by digest, with every tag on it.
-    pub async fn delete_manifest(&self, digest: &str) -> anyhow::Result<()> {
-        let url = self.url(&format!("/manifests/{digest}"));
-        check(self.send(|c| c.delete(&url)).await?, "manifest delete").await?;
+    /// Deletes a tag, or a manifest by digest: the registry refuses while a tag or an index references it.
+    pub async fn delete(&self, reference: &str) -> anyhow::Result<()> {
+        let url = self.url(&format!("/manifests/{reference}"));
+        check(self.send(|c| c.delete(&url)).await?, "delete").await?;
         Ok(())
     }
 
@@ -296,16 +296,14 @@ mod tests {
 
     #[tokio::test]
     async fn a_refused_delete_gets_the_registry_message() {
-        let body = r#"{"errors":[{"code":"UNSUPPORTED","message":"manifest sha256:a is referenced by index sha256:b, delete the index first"}]}"#;
+        let body =
+            r#"{"errors":[{"code":"UNSUPPORTED","message":"manifest sha256:a is tagged latest, v1, untag it first"}]}"#;
         let app = Router::new().route(
             "/v2/{ns}/{name}/manifests/{reference}",
             delete(move || async move { (StatusCode::BAD_REQUEST, body) }),
         );
-        let err = serve(app).await.delete_manifest("sha256:a").await.unwrap_err();
-        assert_eq!(
-            err.to_string(),
-            "manifest delete: 400 Bad Request: manifest sha256:a is referenced by index sha256:b, delete the index first"
-        );
+        let err = serve(app).await.delete("sha256:a").await.unwrap_err();
+        assert_eq!(err.to_string(), "delete: 400 Bad Request: manifest sha256:a is tagged latest, v1, untag it first");
     }
 
     #[test]

@@ -44,8 +44,10 @@ pub enum Op {
     },
     /// Serves the build endpoint on loopback; prints its `Endpoint`, then its `Summary` once stopped.
     Serve { image: String },
-    /// Deletes the image a tag or digest names, with every tag on it; prints its digest.
+    /// Deletes an image by digest; the registry refuses while a tag or an index references it.
     Delete { image: String },
+    /// Deletes a tag; prints the digest it pointed to.
+    Untag { image: String },
 }
 
 impl Op {
@@ -96,10 +98,17 @@ impl Op {
             }
             Op::Delete { image } => {
                 let image = ImageRef::parse(&image)?;
+                let digest = image.digest.clone().context("delete takes <registry>/<namespace>/<name>@<digest>")?;
+                Registry::new(&image, token, true)?.delete(&digest).await?;
+                Self::print_digest(&digest);
+            }
+            Op::Untag { image } => {
+                let image = ImageRef::parse(&image)?;
+                let tag = image.tag.clone().filter(|_| image.digest.is_none());
+                let tag = tag.context("untag takes <registry>/<namespace>/<name>:<tag>")?;
                 let registry = Registry::new(&image, token, true)?;
-                let manifest =
-                    registry.manifest(&image.reference()).await?.with_context(|| format!("{image} not found"))?;
-                registry.delete_manifest(&manifest.digest).await?;
+                let manifest = registry.manifest(&tag).await?.with_context(|| format!("{image} not found"))?;
+                registry.delete(&tag).await?;
                 Self::print_digest(&manifest.digest);
             }
         }

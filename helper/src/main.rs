@@ -86,8 +86,12 @@ mod tests {
         let cli = parse(&[&store[..], &["serve", "cr.hf.co/a/b"]].concat());
         assert!(matches!(cli.op, Op::Serve { .. }));
 
-        let cli = parse(&[&store[..], &["delete", "cr.hf.co/a/b:v1"]].concat());
-        assert!(matches!(cli.op, Op::Delete { ref image } if image == "cr.hf.co/a/b:v1"));
+        let d = format!("cr.hf.co/a/b@sha256:{}", "a".repeat(64));
+        let cli = parse(&[&store[..], &["delete", &d]].concat());
+        assert!(matches!(cli.op, Op::Delete { ref image } if *image == d));
+
+        let cli = parse(&[&store[..], &["untag", "cr.hf.co/a/b:v1"]].concat());
+        assert!(matches!(cli.op, Op::Untag { ref image } if image == "cr.hf.co/a/b:v1"));
 
         assert!(Cli::try_parse_from(["hf-image-helper", "pull", "x", "--platform", "p", "--owner", "0:0"]).is_err());
     }
