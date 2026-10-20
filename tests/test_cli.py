@@ -117,6 +117,34 @@ def test_run_needs_an_image(hfi):
     assert calls == []
 
 
+def test_delete(hfi):
+    done, (helper,) = hfi("delete", f"cr.hf.co/a/b@{DIGEST}")
+    assert (done.returncode, done.stdout) == (0, f"{DIGEST}\n"), done.stderr
+    assert done.stderr == f"deleted cr.hf.co/a/b@{DIGEST}\n"
+    assert op(helper) == ["delete", f"cr.hf.co/a/b@{DIGEST}"]
+
+
+def test_delete_takes_a_digest(hfi):
+    for image in ("cr.hf.co/a/b", "cr.hf.co/a/b:v1"):
+        done, calls = hfi("delete", image)
+        assert done.returncode == 1 and "delete takes a digest" in done.stderr
+        assert calls == []
+
+
+def test_untag(hfi):
+    done, (helper,) = hfi("untag", "cr.hf.co/a/b:v1")
+    assert (done.returncode, done.stdout) == (0, f"{DIGEST}\n"), done.stderr
+    assert done.stderr == f"untagged cr.hf.co/a/b:v1; the image stays as cr.hf.co/a/b@{DIGEST}\n"
+    assert op(helper) == ["untag", "cr.hf.co/a/b:v1"]
+
+
+def test_untag_takes_a_tag(hfi):
+    for image in ("cr.hf.co/a/b", f"cr.hf.co/a/b:v1@{DIGEST}"):
+        done, calls = hfi("untag", image)
+        assert done.returncode == 1 and "expected <registry>/<namespace>/<name>:<tag>" in done.stderr
+        assert calls == []
+
+
 def test_build(hfi):
     done, (serve, build) = hfi("build", "-t", "cr.hf.co/a/b:v1", "--build-arg", "X=1", "ctx")
     assert (done.returncode, done.stdout) == (0, f"{BUILT}\n"), done.stderr

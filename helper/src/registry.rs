@@ -41,6 +41,51 @@ pub struct Manifest {
     pub digest: String,
 }
 
+/// A delete the registry refused (4xx), with what still references the manifest when it says.
+#[derive(Debug)]
+pub struct Refused {
+    pub message: String,
+    pub references: Option<References>,
+}
+
+impl Refused {
+    /// From an OCI error body; `references` from the Hugging Face registry's `detail`.
+    fn parse(body: &str) -> Option<Self> {
+        let v: serde_json::Value = serde_json::from_str(body).ok()?;
+        let e = v["errors"].get(0)?;
+        let message = e["message"].as_str().unwrap_or_default().trim().to_string();
+        let references = serde_json::from_value::<References>(e["detail"].clone())
+            .ok()
+            .filter(|r| !r.tags.is_empty() || !r.indexes.is_empty());
+        Some(Self { message, references })
+    }
+}
+
+impl std::fmt::Display for Refused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for Refused {}
+
+/// Tags and indexes that reference a manifest whose delete was refused.
+#[derive(Debug, Default, Deserialize)]
+pub struct References {
+    #[serde(default)]
+    pub tags: Vec<String>,
+    #[serde(default)]
+    pub indexes: Vec<IndexRef>,
+}
+
+/// An index listing the manifest, with its own tags.
+#[derive(Debug, Deserialize)]
+pub struct IndexRef {
+    pub digest: String,
+    #[serde(default)]
+    pub tags: Vec<String>,
+}
+
 pub struct Registry {
     /// No redirects: blob `GET`s are inspected before following.
     api: reqwest::Client,
@@ -126,6 +171,23 @@ impl Registry {
         let resp = self.send(|c| c.put(&url).header(header::CONTENT_TYPE, media_type).body(bytes.clone())).await?;
         check(resp, "manifest push").await?;
         Ok(sha256(bytes))
+    }
+
+    /// Deletes a tag, or a manifest by digest: the registry refuses while a tag or an index
+    /// references it (a `Refused` error).
+    pub async fn delete(&self, reference: &str) -> anyhow::Result<()> {
+        let url = self.url(&format!("/manifests/{reference}"));
+        let resp = self.send(|c| c.delete(&url)).await?;
+        if resp.status().is_client_error() {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            return Err(match Refused::parse(&body) {
+                Some(refused) => refused.into(),
+                None => anyhow::anyhow!("delete: {status}: {}", body.trim()),
+            });
+        }
+        check(resp, "delete").await?;
+        Ok(())
     }
 
     /// `HEAD` of a blob: its size and, on the Hugging Face registry, its Xet hash.
@@ -253,19 +315,22 @@ fn oci_error(body: &str) -> Option<(String, String)> {
 #[cfg(test)]
 mod tests {
     use axum::Router;
-    use axum::routing::get;
+    use axum::routing::{delete, get};
 
     use super::*;
 
-    /// A loopback registry whose `_hf/xet-token` answers `status` with `body`.
-    async fn registry(status: StatusCode, body: &'static str) -> Arc<Registry> {
-        let app = Router::new()
-            .route("/v2/", get(|| async { StatusCode::OK }))
-            .route("/v2/{ns}/{name}/_hf/xet-token", get(move || async move { (status, body) }));
+    /// A client of `app`, served on loopback as an anonymous registry.
+    async fn serve(app: Router) -> Arc<Registry> {
+        let app = app.route("/v2/", get(|| async { StatusCode::OK }));
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
         Registry::new(&ImageRef::parse(&format!("{addr}/acme/app")).unwrap(), None, true).unwrap()
+    }
+
+    /// A loopback registry whose `_hf/xet-token` answers `status` with `body`.
+    async fn registry(status: StatusCode, body: &'static str) -> Arc<Registry> {
+        serve(Router::new().route("/v2/{ns}/{name}/_hf/xet-token", get(move || async move { (status, body) }))).await
     }
 
     #[tokio::test]
@@ -282,6 +347,35 @@ mod tests {
     async fn a_registry_without_xet_says_so() {
         let err = registry(StatusCode::NOT_FOUND, "404 page not found").await.xet_token(true).await.unwrap_err();
         assert!(err.to_string().contains("does not support Xet transfers"), "{err}");
+    }
+
+    /// A loopback registry whose manifest `DELETE` answers `status` with `body`.
+    async fn deleting(status: StatusCode, body: &'static str) -> anyhow::Error {
+        let route = delete(move || async move { (status, body) });
+        let registry = serve(Router::new().route("/v2/{ns}/{name}/manifests/{reference}", route)).await;
+        registry.delete("sha256:a").await.unwrap_err()
+    }
+
+    #[tokio::test]
+    async fn a_refused_delete_says_what_references_the_manifest() {
+        let body = r#"{"errors":[{"code":"DENIED","message":"manifest sha256:a is tagged arm64 and listed by index sha256:i (tagged multi): delete them first","detail":{"tags":["arm64"],"indexes":[{"digest":"sha256:i","tags":["multi"]}]}}]}"#;
+        let err = deleting(StatusCode::CONFLICT, body).await;
+        let refused = err.downcast_ref::<Refused>().expect("a refusal");
+        assert!(refused.message.starts_with("manifest sha256:a is tagged arm64"), "{}", refused.message);
+        let refs = refused.references.as_ref().expect("references");
+        assert_eq!(refs.tags, ["arm64"]);
+        assert_eq!(
+            (refs.indexes[0].digest.as_str(), &refs.indexes[0].tags[..]),
+            ("sha256:i", &["multi".to_string()][..])
+        );
+
+        // Other refusals keep the registry's message; their detail is not references.
+        let body = r#"{"errors":[{"code":"MANIFEST_UNKNOWN","message":"manifest unknown","detail":{"Tag":"v1"}}]}"#;
+        let err = deleting(StatusCode::NOT_FOUND, body).await;
+        let refused = err.downcast_ref::<Refused>().expect("a refusal");
+        assert_eq!((refused.message.as_str(), refused.references.is_none()), ("manifest unknown", true));
+        let err = deleting(StatusCode::METHOD_NOT_ALLOWED, "405 method not allowed").await;
+        assert_eq!(err.to_string(), "delete: 405 Method Not Allowed: 405 method not allowed");
     }
 
     #[test]

@@ -8,6 +8,8 @@ $ hf image build -t cr.hf.co/acme/app:v2 .       # your Dockerfile, your buildx
 $ hf image push cr.hf.co/acme/app:v2              # an image already in your Docker store
 $ hf image pull cr.hf.co/acme/app:v2 [-o dir]     # into Docker, or an OCI layout
 $ hf image run --rm cr.hf.co/acme/app:v2          # pulls first if needed, then docker run
+$ hf image untag cr.hf.co/acme/app:v2             # the tag; the image stays, by digest
+$ hf image delete cr.hf.co/acme/app@sha256:…      # an image no tag points to
 ```
 
 Images stay plain OCI: anything pushed with `hf image` pulls with `docker pull`, and `hf image pull`

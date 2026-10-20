@@ -146,6 +146,32 @@ def run(token: str | None, args: tuple[str, ...]) -> None:
     os.execvp("docker", ["docker", "run", *args])
 
 
+@cli.command()
+@click.argument("image")
+@click.pass_obj
+def delete(token: str | None, image: str) -> None:
+    """Delete an image from the registry by digest, once no tag references it."""
+    ref = ImageRef.parse(image)
+    if not ref.digest:
+        raise click.ClickException(f"{image}: delete takes a digest (remove tags with hf image untag)")
+    digest = Helper(Daemon.detect()).run(["delete", str(ref)], hf_token(token))["digest"]
+    click.echo(f"deleted {ref.registry}/{ref.repo}@{digest}", err=True)
+    click.echo(digest)
+
+
+@cli.command()
+@click.argument("image")
+@click.pass_obj
+def untag(token: str | None, image: str) -> None:
+    """Remove a tag from the registry; the image stays, by digest, until deleted."""
+    ref = ImageRef.parse(image)
+    if not ref.tag or ref.digest:
+        raise click.ClickException(f"{image}: expected <registry>/<namespace>/<name>:<tag>")
+    digest = Helper(Daemon.detect()).run(["untag", str(ref)], hf_token(token))["digest"]
+    click.echo(f"untagged {ref.tagged()}; the image stays as {ref.registry}/{ref.repo}@{digest}", err=True)
+    click.echo(digest)
+
+
 def parse_or_none(s: str) -> ImageRef | None:
     try:
         return ImageRef.parse(s)

@@ -16,7 +16,7 @@ use crate::oci::Platform;
 use crate::pull::{PullOpts, Target, pull};
 use crate::push::{Origin, PushOpts, push};
 use crate::reference::ImageRef;
-use crate::registry::Registry;
+use crate::registry::{Refused, Registry};
 use crate::xet::Xet;
 
 #[derive(Debug, Clone, Subcommand)]
@@ -44,6 +44,10 @@ pub enum Op {
     },
     /// Serves the build endpoint on loopback; prints its `Endpoint`, then its `Summary` once stopped.
     Serve { image: String },
+    /// Deletes an image by digest; the registry refuses while a tag or an index references it.
+    Delete { image: String },
+    /// Deletes a tag; prints the digest it pointed to.
+    Untag { image: String },
 }
 
 impl Op {
@@ -92,8 +96,46 @@ impl Op {
                 serving.abort();
                 println!("{}", serde_json::to_string(&gw.summary().await)?);
             }
+            Op::Delete { image } => {
+                let image = ImageRef::parse(&image)?;
+                let digest = image.digest.clone().context("delete takes <registry>/<namespace>/<name>@<digest>")?;
+                let deleted = Registry::new(&image, token, true)?.delete(&digest).await;
+                deleted.map_err(|e| Self::refused(e, "delete", &image))?;
+                Self::print_digest(&digest);
+            }
+            Op::Untag { image } => {
+                let image = ImageRef::parse(&image)?;
+                let tag = image.tag.clone().filter(|_| image.digest.is_none());
+                let tag = tag.context("untag takes <registry>/<namespace>/<name>:<tag>")?;
+                let registry = Registry::new(&image, token, true)?;
+                let manifest = registry.manifest(&tag).await?.with_context(|| format!("{image} not found"))?;
+                registry.delete(&tag).await.map_err(|e| Self::refused(e, "untag", &image))?;
+                Self::print_digest(&manifest.digest);
+            }
         }
         Ok(())
+    }
+
+    /// A refused delete of `image`, explained: what still references it and how to remove that.
+    fn refused(e: anyhow::Error, verb: &str, image: &ImageRef) -> anyhow::Error {
+        let Some(refused) = e.downcast_ref::<Refused>() else { return e };
+        let Some(refs) = &refused.references else {
+            return anyhow!("cannot {verb} {image}: {}", refused.message);
+        };
+        let name = format!("{}/{}", image.registry, image.repo);
+        let mut lines = vec![format!("cannot {verb} {image}: still referenced by")];
+        lines.extend(refs.tags.iter().map(|t| format!("  tag {t}")));
+        lines.extend(refs.indexes.iter().map(|i| match i.tags.is_empty() {
+            true => format!("  index {}", i.digest),
+            false => format!("  index {} (tagged {})", i.digest, i.tags.join(", ")),
+        }));
+        lines.push("remove them first:".into());
+        lines.extend(refs.tags.iter().map(|t| format!("  hf image untag {name}:{t}")));
+        for i in &refs.indexes {
+            lines.extend(i.tags.iter().map(|t| format!("  hf image untag {name}:{t}")));
+            lines.push(format!("  hf image delete {name}@{}", i.digest));
+        }
+        anyhow!(lines.join("\n"))
     }
 
     fn store(store: Option<Store>) -> anyhow::Result<Store> {
@@ -140,5 +182,41 @@ impl HostLink {
     /// Resolves when the host asks to stop (a line, or EOF).
     async fn stopped(mut self) {
         let _ = self.lines.next_line().await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::registry::{IndexRef, References};
+
+    #[test]
+    fn refused_deletes_list_the_references_and_the_commands_that_remove_them() {
+        let (m, i) = (format!("sha256:{}", "a".repeat(64)), format!("sha256:{}", "b".repeat(64)));
+        let image = ImageRef::parse(&format!("cr.hf.co/acme/app@{m}")).unwrap();
+        let refs = References {
+            tags: vec!["arm64".into()],
+            indexes: vec![IndexRef { digest: i.clone(), tags: vec!["multi".into()] }],
+        };
+        let refused = Refused { message: "manifest … is tagged arm64".into(), references: Some(refs) };
+        let err = Op::refused(refused.into(), "delete", &image);
+        assert_eq!(
+            err.to_string(),
+            [
+                format!("cannot delete cr.hf.co/acme/app@{m}: still referenced by"),
+                "  tag arm64".into(),
+                format!("  index {i} (tagged multi)"),
+                "remove them first:".into(),
+                "  hf image untag cr.hf.co/acme/app:arm64".into(),
+                "  hf image untag cr.hf.co/acme/app:multi".into(),
+                format!("  hf image delete cr.hf.co/acme/app@{i}"),
+            ]
+            .join("\n")
+        );
+
+        let refused = Refused { message: format!("manifest {m} does not exist"), references: None };
+        let err = Op::refused(refused.into(), "delete", &image);
+        assert_eq!(err.to_string(), format!("cannot delete cr.hf.co/acme/app@{m}: manifest {m} does not exist"));
+        assert_eq!(Op::refused(anyhow!("timeout"), "delete", &image).to_string(), "timeout");
     }
 }
