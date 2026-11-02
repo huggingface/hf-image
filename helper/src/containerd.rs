@@ -10,6 +10,7 @@ use bytes::Bytes;
 use containerd_client::services::v1::content_client::ContentClient;
 use containerd_client::services::v1::diff_client::DiffClient;
 use containerd_client::services::v1::images_client::ImagesClient;
+use containerd_client::services::v1::introspection_client::IntrospectionClient;
 use containerd_client::services::v1::leases_client::LeasesClient;
 use containerd_client::services::v1::snapshots::snapshots_client::SnapshotsClient;
 use containerd_client::services::v1::snapshots::{
@@ -17,9 +18,9 @@ use containerd_client::services::v1::snapshots::{
 };
 use containerd_client::services::v1::{
     ApplyRequest, CreateImageRequest, CreateRequest, DeleteRequest, GetImageRequest, Image, Info, InfoRequest,
-    ReadContentRequest, UpdateImageRequest, WriteAction, WriteContentRequest,
+    PluginsRequest, ReadContentRequest, UpdateImageRequest, WriteAction, WriteContentRequest,
 };
-use containerd_client::types::Descriptor;
+use containerd_client::types::{Descriptor, Mount};
 use futures::{Stream, StreamExt};
 use tokio::sync::mpsc;
 use tonic::transport::Channel;
@@ -195,6 +196,15 @@ impl Containerd {
         }
     }
 
+    /// Whether the snapshotter commits a snapshot onto a parent it was not prepared on (containerd 2.2+),
+    /// so layers can be unpacked at once and committed in chain order.
+    pub async fn rebases(&self) -> anyhow::Result<bool> {
+        let filters = vec![format!("type==io.containerd.snapshotter.v1,id=={}", self.snapshotter)];
+        let plugins =
+            IntrospectionClient::new(self.channel.clone()).plugins(self.req(PluginsRequest { filters })).await?;
+        Ok(plugins.into_inner().plugins.iter().any(|p| p.capabilities.iter().any(|c| c == "rebase")))
+    }
+
     /// Applies `layer` on top of `parent` into the snapshot `chain_id` (a no-op when it exists);
     /// returns whether it unpacked anything.
     pub async fn unpack(
@@ -207,40 +217,88 @@ impl Containerd {
         if self.snapshot_exists(chain_id).await? {
             return Ok(false);
         }
+        let key = self.apply(layer, diff_id, chain_id, parent, false).await?;
+        self.commit(&key, chain_id, None).await
+    }
+
+    /// Applies `layer` into a new active snapshot on `parent`; returns its key, for [`Containerd::commit`].
+    /// `unmounted_lower`: layers below it exist but are not its parent yet, so its whiteouts must be kept.
+    pub async fn apply(
+        &self,
+        layer: &Descriptor,
+        diff_id: &str,
+        chain_id: &str,
+        parent: Option<&str>,
+        unmounted_lower: bool,
+    ) -> anyhow::Result<String> {
         let key = format!("extract-{} {chain_id}", uuid::Uuid::new_v4());
-        let mut snapshots = SnapshotsClient::new(self.channel.clone());
         let prepare = PrepareSnapshotRequest {
             snapshotter: self.snapshotter.clone(),
             key: key.clone(),
             parent: parent.unwrap_or_default().into(),
             labels: HashMap::new(),
         };
-        let mounts = snapshots.prepare(self.req(prepare)).await?.into_inner().mounts;
-        let result = async {
+        let mut mounts =
+            SnapshotsClient::new(self.channel.clone()).prepare(self.req(prepare)).await?.into_inner().mounts;
+        if unmounted_lower && self.snapshotter == "overlayfs" {
+            mounts = Self::upper_only(mounts);
+        }
+        let applied = async {
             let apply = ApplyRequest { diff: Some(layer.clone()), mounts, payloads: HashMap::new(), sync_fs: false };
             let applied = DiffClient::new(self.channel.clone()).apply(self.req(apply)).await?.into_inner().applied;
             let got = applied.map(|d| d.digest).unwrap_or_default();
             if got != diff_id {
                 bail!("layer {} unpacked to {got}, expected {diff_id}", layer.digest);
             }
-            let commit = CommitSnapshotRequest {
-                snapshotter: self.snapshotter.clone(),
-                name: chain_id.into(),
-                key: key.clone(),
-                labels: HashMap::new(),
-            };
-            match snapshots.clone().commit(self.req(commit)).await {
-                Ok(_) => Ok(true),
-                Err(s) if s.code() == Code::AlreadyExists => Ok(false),
-                Err(s) => Err(s.into()),
-            }
+            Ok(())
         }
         .await;
-        if !matches!(result, Ok(true)) {
-            let rm = RemoveSnapshotRequest { snapshotter: self.snapshotter.clone(), key };
-            let _ = snapshots.remove(self.req(rm)).await;
+        match applied {
+            Ok(()) => Ok(key),
+            Err(e) => {
+                self.remove_snapshot(&key).await;
+                Err(e)
+            }
         }
+    }
+
+    /// Commits the active snapshot `key` as `chain_id`, onto `parent` when given (the snapshotter must
+    /// rebase); returns whether it was new.
+    pub async fn commit(&self, key: &str, chain_id: &str, parent: Option<&str>) -> anyhow::Result<bool> {
+        let commit = CommitSnapshotRequest {
+            snapshotter: self.snapshotter.clone(),
+            name: chain_id.into(),
+            key: key.into(),
+            labels: HashMap::new(),
+            parent: parent.unwrap_or_default().into(),
+        };
+        let result = match SnapshotsClient::new(self.channel.clone()).commit(self.req(commit)).await {
+            Ok(_) => return Ok(true),
+            Err(s) if s.code() == Code::AlreadyExists => Ok(false),
+            Err(s) => Err(s.into()),
+        };
+        self.remove_snapshot(key).await;
         result
+    }
+
+    /// overlayfs mounts a snapshot without parent as a bind mount, which the applier unpacks deleting what
+    /// whiteouts name; as an overlay mount of its upper directory alone, they become overlay whiteouts.
+    fn upper_only(mounts: Vec<Mount>) -> Vec<Mount> {
+        match <[Mount; 1]>::try_from(mounts) {
+            Ok([m]) if m.r#type == "bind" => {
+                let mut options: Vec<String> = m.options.into_iter().filter(|o| o != "rbind").collect();
+                options.push(format!("upperdir={}", m.source));
+                vec![Mount { r#type: "overlay".into(), source: "overlay".into(), options, ..Default::default() }]
+            }
+            Ok(m) => m.into(),
+            Err(mounts) => mounts,
+        }
+    }
+
+    /// Removes an active snapshot, best effort: the lease's expiry collects what this misses.
+    pub async fn remove_snapshot(&self, key: &str) {
+        let rm = RemoveSnapshotRequest { snapshotter: self.snapshotter.clone(), key: key.into() };
+        let _ = SnapshotsClient::new(self.channel.clone()).remove(self.req(rm)).await;
     }
 }
 
@@ -265,6 +323,20 @@ fn rfc3339(t: SystemTime) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parentless_overlay_snapshots_apply_to_their_upper_directory() {
+        let mount = |t: &str, source: &str, options: &[&str]| Mount {
+            r#type: t.into(),
+            source: source.into(),
+            options: options.iter().map(|o| o.to_string()).collect(),
+            ..Default::default()
+        };
+        let got = Containerd::upper_only(vec![mount("bind", "/s/1/fs", &["rw", "rbind"])]);
+        assert_eq!(got, vec![mount("overlay", "overlay", &["rw", "upperdir=/s/1/fs"])]);
+        let layered = vec![mount("overlay", "overlay", &["upperdir=/s/2/fs", "lowerdir=/s/1/fs"])];
+        assert_eq!(Containerd::upper_only(layered.clone()), layered);
+    }
 
     #[test]
     fn timestamps() {
