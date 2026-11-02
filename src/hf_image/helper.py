@@ -16,6 +16,7 @@ import click
 
 from ._pin import HELPER_IMAGE
 from .docker import Daemon, anonymous, image_exists
+from .progress import Progress
 
 CACHE_VOLUME = "hf-image-cache"
 """Named volume holding the Xet caches (`HF_IMAGE_CACHE_VOLUME` overrides)."""
@@ -105,7 +106,7 @@ class Helper:
     def run(self, op: list[str], token: str | None, layout: Layout | None = None) -> dict:
         """Runs `op` to completion; returns its result."""
         with self.start(op, token, layout) as running:
-            return running.result(running.wait())
+            return running.result(running.wait(Progress()))
 
 
 class Running:
@@ -146,10 +147,24 @@ class Running:
         self.send("")
         return self.wait()
 
-    def wait(self) -> list[str]:
-        lines = [line.rstrip("\n") for line in self.proc.stdout]
+    def wait(self, progress: Progress | None = None) -> list[str]:
+        """The rest of what the helper prints, its progress drawn by `progress`."""
+        lines = []
+        for line in self.proc.stdout:
+            line = line.rstrip("\n")
+            if progress and line.startswith("{") and progress.event(Running.parse(line)):
+                continue
+            lines.append(line)
         self.exit()
         return lines
+
+    @staticmethod
+    def parse(line: str) -> dict:
+        try:
+            event = json.loads(line)
+        except ValueError:
+            return {}
+        return event if isinstance(event, dict) else {}
 
     @staticmethod
     def result(lines: list[str]) -> dict:

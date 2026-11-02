@@ -14,6 +14,7 @@ use tokio::io::AsyncReadExt;
 
 use crate::containerd::Containerd;
 use crate::oci::{self, Descriptor, Index, Manifest, Platform, chain_ids, diff_ids, is_index};
+use crate::progress::Progress;
 use crate::reference::ImageRef;
 use crate::registry::{BlobInfo, Registry};
 use crate::util::{self, xet_stream};
@@ -183,18 +184,28 @@ async fn write_image(
     });
     let unpacks = Arc::new(tokio::sync::Semaphore::new(util::concurrency()));
 
+    let progress: Vec<_> = r.manifest.layers.iter().map(|l| Arc::new(Progress::new(&l.digest, Some(l.size)))).collect();
+    for p in &progress {
+        p.status("Waiting");
+    }
+
     // Each layer resolves to whether it was fetched, and the key of the snapshot it was unpacked into.
     let mut layers = Vec::new();
     for (i, ((layer, diff), chain)) in r.manifest.layers.iter().zip(&diffs).zip(&chains).enumerate() {
         let (cd, registry, downloader) = (cd.clone(), registry.clone(), downloader.clone());
-        let (permits, unpacks) = (permits.clone(), unpacks.clone());
+        let (permits, unpacks, p) = (permits.clone(), unpacks.clone(), progress[i].clone());
         let (layer, diff, chain, source) = (layer.clone(), diff.clone(), chain.clone(), source.clone());
         layers.push(tokio::spawn(async move {
-            let fetched = fetch(&cd, &registry, &downloader, &permits, &layer, &diff, source).await?;
+            let mut labels = HashMap::from([source]);
+            if layer.digest != diff {
+                labels.insert("containerd.io/uncompressed".into(), diff.clone());
+            }
+            let fetched = fetch(&cd, &registry, &downloader, &permits, &layer, labels, &p).await?;
             if !rebase || cd.snapshot_exists(&chain).await? {
                 return anyhow::Ok((fetched, None));
             }
             let _permit = unpacks.acquire_owned().await?;
+            p.status("Extracting");
             let started = Instant::now();
             let key = cd.apply(&(&layer).into(), &diff, &chain, None, i > 0).await?;
             tracing::debug!(layer = %layer.digest, secs = started.elapsed().as_secs_f64(), "unpacked");
@@ -217,10 +228,15 @@ async fn write_image(
         result = async {
             let (f, key) = done?;
             fetched += usize::from(f);
-            match key {
+            let unpacked = match key {
                 Some(key) => cd.commit(&key, &chains[i], parent).await?,
-                None => cd.unpack(&layer.into(), &diffs[i], &chains[i], parent).await?,
+                None if cd.snapshot_exists(&chains[i]).await? => false,
+                None => {
+                    progress[i].status("Extracting");
+                    cd.unpack(&layer.into(), &diffs[i], &chains[i], parent).await?
+                }
             };
+            progress[i].status(if f || unpacked { "Pull complete" } else { "Already exists" });
             anyhow::Ok(())
         }
         .await;
@@ -261,22 +277,25 @@ async fn fetch(
     downloader: &Downloader,
     permits: &tokio::sync::Semaphore,
     layer: &Descriptor,
-    diff: &str,
-    source: (String, String),
+    labels: HashMap<String, String>,
+    progress: &Progress,
 ) -> anyhow::Result<bool> {
     if cd.info(&layer.digest).await?.is_some() {
         return Ok(false);
     }
     let _permit = permits.acquire().await?;
-    let mut labels = HashMap::from([source]);
-    if layer.digest != diff {
-        labels.insert("containerd.io/uncompressed".into(), diff.into());
-    }
+    progress.start("Downloading");
     let started = Instant::now();
     let info = layer_info(registry, layer).await?;
     let stream = layer_stream(registry, downloader, layer, info).await?;
+    let stream = stream.inspect(|b| {
+        if let Ok(b) = b {
+            progress.advance("Downloading", b.len() as u64);
+        }
+    });
     cd.write(&layer.digest, layer.size, labels, stream).await?;
     tracing::debug!(layer = %layer.digest, size = layer.size, secs = started.elapsed().as_secs_f64(), "fetched");
+    progress.status("Download complete");
     Ok(true)
 }
 
@@ -296,10 +315,13 @@ async fn into_layout(
     let layers: Vec<_> = r.manifest.layers.iter().filter(|l| seen.insert(l.digest.as_str())).cloned().collect();
     let mut tasks = futures::stream::iter(layers.into_iter().map(|layer| {
         let (registry, downloader, target) = (registry.clone(), downloader.clone(), path(&layer.digest));
+        let progress = Progress::new(&layer.digest, Some(layer.size));
         async move {
             if tokio::fs::try_exists(&target).await? {
+                progress.status("Already exists");
                 return anyhow::Ok(false);
             }
+            progress.status("Downloading");
             let info = layer_info(&registry, &layer).await?;
             let partial = target.with_extension("partial");
             match info.xet_hash {
@@ -316,6 +338,7 @@ async fn into_layout(
                 bail!("layer {} does not match its digest", layer.digest);
             }
             tokio::fs::rename(&partial, &target).await?;
+            progress.status("Download complete");
             Ok(true)
         }
     }))
