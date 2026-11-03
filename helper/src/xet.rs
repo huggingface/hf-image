@@ -2,7 +2,8 @@
 //!
 //! Each file upload runs in a detached task fed through a channel, so a dropped request (the local
 //! gateway serves BuildKit) never cancels a xet-core future: its shard-cache lock is not
-//! cancel-safe. Downloads use the chunk cache, which makes re-pulls of rebuilt layers cheap.
+//! cancel-safe. Downloads skip xet-core's chunk cache unless `HF_IMAGE_CHUNK_CACHE_BYTES` sizes it:
+//! it makes re-pulls of rebuilt layers cheaper, but a cold pull writes every layer twice.
 
 use std::sync::Arc;
 
@@ -22,8 +23,6 @@ use xet_runtime::core::{XetContext, xet_cache_root};
 
 use crate::registry::Registry;
 
-/// Default chunk cache size (`HF_IMAGE_CHUNK_CACHE_BYTES` overrides, 0 disables).
-const CHUNK_CACHE_BYTES: u64 = 20_000_000_000;
 /// Concurrent xorb uploads.
 const UPLOAD_CONCURRENCY: usize = 8;
 /// Dedup's target chunks per file range (xet-core: 8): fewer, larger fetches on pulls.
@@ -71,18 +70,30 @@ impl Xet {
     }
 
     pub async fn downloader(&self) -> anyhow::Result<Downloader> {
-        let size =
-            std::env::var("HF_IMAGE_CHUNK_CACHE_BYTES").ok().and_then(|v| v.parse().ok()).unwrap_or(CHUNK_CACHE_BYTES);
+        let size: u64 = std::env::var("HF_IMAGE_CHUNK_CACHE_BYTES").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
+        let dir = xet_cache_root().join("chunk-cache");
         let cache = if size > 0 {
-            let cfg = CacheConfig { cache_directory: xet_cache_root().join("chunk-cache"), cache_size: size };
+            let cfg = CacheConfig { cache_directory: dir, cache_size: size };
             Some(get_cache(&self.ctx.config, &cfg).context("failed to open the chunk cache")?)
         } else {
+            Self::drop_chunk_cache(dir);
             None
         };
         let session = FileDownloadSession::new(self.config(false).await?, cache)
             .await
             .context("failed to open a download session")?;
         Ok(Downloader { session })
+    }
+
+    /// Removes a chunk cache left in `dir` (up to 20 GB from earlier versions), in the background.
+    fn drop_chunk_cache(dir: std::path::PathBuf) {
+        if dir.exists() {
+            tokio::task::spawn_blocking(move || {
+                if let Err(e) = std::fs::remove_dir_all(&dir) {
+                    tracing::warn!("failed to remove {}: {e}", dir.display());
+                }
+            });
+        }
     }
 }
 
