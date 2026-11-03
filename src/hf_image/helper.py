@@ -24,7 +24,7 @@ CACHE_DIR = "/cache"
 CONTAINERD_SOCKET = "/run/hf-image/containerd.sock"
 LAYOUT = "/layout"
 """Where an OCI layout is mounted."""
-FORWARDED = ("HF_IMAGE_CONCURRENCY", "HF_IMAGE_CHUNK_CACHE_BYTES", "HF_IMAGE_INSECURE_REGISTRIES", "HF_IMAGE_LOG")
+FORWARDED = ("HF_IMAGE_CONCURRENCY", "HF_IMAGE_INSECURE_REGISTRIES", "HF_IMAGE_LOG")
 """Settings the helper inherits, passed by name so values stay off the command line."""
 
 
