@@ -19,6 +19,7 @@ use tokio::sync::{Mutex, mpsc};
 
 use crate::containerd::{Containerd, Store};
 use crate::oci::{self, Compression, Descriptor, Index, Manifest, diff_ids, is_index, sha256};
+use crate::progress::Progress;
 use crate::reference::ImageRef;
 use crate::registry::{Registration, Registry};
 use crate::util;
@@ -140,6 +141,7 @@ pub async fn push(opts: &PushOpts) -> anyhow::Result<String> {
     let ctx = Ctx { source: source.as_ref(), registry: &registry, uploader: &uploader, totals: &totals };
     let plan = if opts.preserve_digests { ctx.preserve().await? } else { ctx.convert().await? };
 
+    Progress::image("Finishing the upload");
     uploader.finalize().await?;
     let totals = totals.into_inner();
     registry.register(&totals.registrations).await?;
@@ -292,6 +294,9 @@ impl Ctx<'_> {
     /// The image as stored: every blob and manifest byte for byte.
     async fn preserve(&self) -> anyhow::Result<Plan> {
         let (plan, blobs) = Plan::verbatim(self.source).await?;
+        for d in blobs.iter().filter(|d| oci::is_layer(&d.media_type)) {
+            Progress::new(&d.digest, Some(d.size)).status("Waiting");
+        }
         futures::stream::iter(blobs.iter().map(anyhow::Ok))
             .try_for_each_concurrent(util::concurrency(), |d| self.raw_blob(d))
             .await?;
@@ -307,6 +312,9 @@ impl Ctx<'_> {
             bail!("the config lists {} layers, the manifest {}", diffs.len(), m.layers.len());
         }
         self.small_blob(&m.config.digest, config).await?;
+        for (l, d) in m.layers.iter().zip(&diffs).filter(|(l, _)| oci::is_layer(&l.media_type)) {
+            Progress::new(d, Some(l.size)).status("Waiting");
+        }
         let sizes: Vec<_> = futures::stream::iter(m.layers.iter().zip(diffs.iter()).map(|(l, d)| self.layer(l, d)))
             .buffered(util::concurrency())
             .collect()
@@ -338,16 +346,26 @@ impl Ctx<'_> {
         if layer {
             self.totals.lock().await.layers += 1;
         }
+        let progress = layer.then(|| Progress::new(&d.digest, Some(d.size)));
         if self.registry.blob(&d.digest).await?.is_some() {
+            if let Some(p) = &progress {
+                p.status("Layer already exists");
+            }
             return Ok(());
         }
         let mut stream = self.source.read(&d.digest).await?;
         let mut up = self.uploader.file(&d.digest, Some(d.size))?;
         let (mut hasher, mut size) = (Sha256::new(), 0u64);
+        if let Some(p) = &progress {
+            p.start("Pushing");
+        }
         while let Some(b) = stream.next().await {
             let b = b?;
             hasher.update(&b);
             size += b.len() as u64;
+            if let Some(p) = &progress {
+                p.advance("Pushing", b.len() as u64);
+            }
             up.write(b).await?;
         }
         let digest = format!("sha256:{}", hex::encode(hasher.finalize()));
@@ -355,6 +373,9 @@ impl Ctx<'_> {
             bail!("blob {} is {digest} ({size} bytes) locally, the manifest says {} bytes", d.digest, d.size);
         }
         let done = up.finish().await?;
+        if let Some(p) = &progress {
+            p.status("Pushed");
+        }
         let mut t = self.totals.lock().await;
         t.new_layers += usize::from(layer);
         t.read += size;
@@ -386,15 +407,19 @@ impl Ctx<'_> {
             self.small_blob(&layer.digest, blob).await?;
             return Ok(size);
         }
+        let progress = Progress::new(diff_id, Some(layer.size));
         if let Some(existing) = self.registry.blob(diff_id).await? {
+            progress.status("Layer already exists");
             return existing.size.with_context(|| format!("the registry gave no size for layer {diff_id}"));
         }
         let stream = self.source.read(&layer.digest).await?;
         let upload = self.uploader.file(diff_id, None)?;
-        let (digest, size, read, done) = decode_into(stream, upload).await?;
+        progress.start("Pushing");
+        let (digest, size, read, done) = decode_into(stream, upload, &progress).await?;
         if digest != diff_id {
             bail!("layer {} decompresses to {digest}, the config says {diff_id}", layer.digest);
         }
+        progress.status("Pushed");
         let mut t = self.totals.lock().await;
         t.new_layers += 1;
         t.read += read;
@@ -409,6 +434,7 @@ impl Ctx<'_> {
 async fn decode_into(
     mut stream: BoxStream<'static, anyhow::Result<Bytes>>,
     mut upload: FileUpload,
+    progress: &Progress,
 ) -> anyhow::Result<(String, u64, u64, crate::xet::Uploaded)> {
     let (in_tx, in_rx) = mpsc::channel::<Bytes>(8);
     let (out_tx, mut out_rx) = mpsc::channel::<Bytes>(4);
@@ -445,6 +471,7 @@ async fn decode_into(
         while let Some(b) = stream.next().await {
             let b = b?;
             read += b.len() as u64;
+            progress.advance("Pushing", b.len() as u64);
             if in_tx.send(b).await.is_err() {
                 break;
             }

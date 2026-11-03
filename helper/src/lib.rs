@@ -6,6 +6,7 @@ pub mod containerd;
 pub mod gateway;
 pub mod oci;
 pub mod op;
+pub mod progress;
 pub mod pull;
 pub mod push;
 pub mod reference;
