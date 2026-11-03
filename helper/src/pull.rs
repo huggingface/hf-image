@@ -176,34 +176,61 @@ async fn write_image(
     let chains = chain_ids(&diffs);
     let source = (format!("containerd.io/distribution.source.{}", image.registry), image.repo.clone());
     let permits = Arc::new(tokio::sync::Semaphore::new(util::concurrency()));
+    // A snapshotter that rebases unpacks each layer as it lands, on nothing; others, in chain order.
+    let rebase = cd.rebases().await.unwrap_or_else(|e| {
+        tracing::warn!("{e:#}: unpacking layers one at a time");
+        false
+    });
+    let unpacks = Arc::new(tokio::sync::Semaphore::new(util::concurrency()));
 
-    // Layers download concurrently; each resolves to whether it was fetched.
-    let mut fetches = Vec::new();
-    for (layer, diff) in r.manifest.layers.iter().zip(&diffs) {
-        let (cd, registry, downloader, permits) = (cd.clone(), registry.clone(), downloader.clone(), permits.clone());
-        let (layer, diff, source) = (layer.clone(), diff.clone(), source.clone());
-        fetches.push(tokio::spawn(async move {
-            if cd.info(&layer.digest).await?.is_some() {
-                return anyhow::Ok(false);
+    // Each layer resolves to whether it was fetched, and the key of the snapshot it was unpacked into.
+    let mut layers = Vec::new();
+    for (i, ((layer, diff), chain)) in r.manifest.layers.iter().zip(&diffs).zip(&chains).enumerate() {
+        let (cd, registry, downloader) = (cd.clone(), registry.clone(), downloader.clone());
+        let (permits, unpacks) = (permits.clone(), unpacks.clone());
+        let (layer, diff, chain, source) = (layer.clone(), diff.clone(), chain.clone(), source.clone());
+        layers.push(tokio::spawn(async move {
+            let fetched = fetch(&cd, &registry, &downloader, &permits, &layer, &diff, source).await?;
+            if !rebase || cd.snapshot_exists(&chain).await? {
+                return anyhow::Ok((fetched, None));
             }
-            let _permit = permits.acquire_owned().await?;
-            let mut labels = HashMap::from([source]);
-            if layer.digest != diff {
-                labels.insert("containerd.io/uncompressed".into(), diff.clone());
-            }
-            let info = layer_info(&registry, &layer).await?;
-            let stream = layer_stream(&registry, &downloader, &layer, info).await?;
-            cd.write(&layer.digest, layer.size, labels, stream).await?;
-            Ok(true)
+            let _permit = unpacks.acquire_owned().await?;
+            let started = Instant::now();
+            let key = cd.apply(&(&layer).into(), &diff, &chain, None, i > 0).await?;
+            tracing::debug!(layer = %layer.digest, secs = started.elapsed().as_secs_f64(), "unpacked");
+            Ok((fetched, Some(key)))
         }));
     }
-    // Unpack in chain order as layers land.
+    // Committed, or unpacked, in chain order.
     let mut fetched = 0;
-    for (i, (fetch, layer)) in fetches.into_iter().zip(&r.manifest.layers).enumerate() {
-        fetched += usize::from(fetch.await??);
+    let mut keys = Vec::new();
+    let mut result = Ok(());
+    for (i, (task, layer)) in layers.into_iter().zip(&r.manifest.layers).enumerate() {
+        let done = task.await.map_err(anyhow::Error::from).and_then(|r| r);
+        if let Ok((_, Some(key))) = &done {
+            keys.push(key.clone());
+        }
+        if result.is_err() {
+            continue;
+        }
         let parent = i.checked_sub(1).map(|p| chains[p].as_str());
-        cd.unpack(&layer.into(), &diffs[i], &chains[i], parent).await?;
+        result = async {
+            let (f, key) = done?;
+            fetched += usize::from(f);
+            match key {
+                Some(key) => cd.commit(&key, &chains[i], parent).await?,
+                None => cd.unpack(&layer.into(), &diffs[i], &chains[i], parent).await?,
+            };
+            anyhow::Ok(())
+        }
+        .await;
     }
+    if result.is_err() {
+        for key in &keys {
+            cd.remove_snapshot(key).await;
+        }
+    }
+    result?;
 
     let sn_label = format!("containerd.io/gc.ref.snapshot.{}", cd.snapshotter);
     let mut labels = HashMap::from([source.clone()]);
@@ -225,6 +252,32 @@ async fn write_image(
     }
     cd.put_image(&local_name(image), (&r.top).into()).await?;
     Ok((r.manifest.layers.len(), fetched))
+}
+
+/// Writes a layer into the content store unless it is there; returns whether it was fetched.
+async fn fetch(
+    cd: &Containerd,
+    registry: &Registry,
+    downloader: &Downloader,
+    permits: &tokio::sync::Semaphore,
+    layer: &Descriptor,
+    diff: &str,
+    source: (String, String),
+) -> anyhow::Result<bool> {
+    if cd.info(&layer.digest).await?.is_some() {
+        return Ok(false);
+    }
+    let _permit = permits.acquire().await?;
+    let mut labels = HashMap::from([source]);
+    if layer.digest != diff {
+        labels.insert("containerd.io/uncompressed".into(), diff.into());
+    }
+    let started = Instant::now();
+    let info = layer_info(registry, layer).await?;
+    let stream = layer_stream(registry, downloader, layer, info).await?;
+    cd.write(&layer.digest, layer.size, labels, stream).await?;
+    tracing::debug!(layer = %layer.digest, size = layer.size, secs = started.elapsed().as_secs_f64(), "fetched");
+    Ok(true)
 }
 
 async fn into_layout(

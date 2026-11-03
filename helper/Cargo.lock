@@ -410,8 +410,7 @@ checksum = "3d52eff69cd5e647efe296129160853a42795992097e8af39800e1060caeea9b"
 [[package]]
 name = "containerd-client"
 version = "0.9.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "814eedf2860b6df6e8002f917a0fbabf53bace3d3d9d2c2022661ae55a6ab6e4"
+source = "git+https://github.com/containerd/rust-extensions?rev=d3960fa56ad1dc6cc161bcf5a4f29b950f877626#d3960fa56ad1dc6cc161bcf5a4f29b950f877626"
 dependencies = [
  "hyper-util",
  "prost",

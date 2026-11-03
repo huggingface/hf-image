@@ -12,7 +12,7 @@ async-trait = "0.1"
 axum = "0.8"
 bytes = "1"
 clap = { version = "4", features = ["derive", "env"] }
-containerd-client = "0.9"
+containerd-client = { git = "https://github.com/containerd/rust-extensions", rev = "d3960fa56ad1dc6cc161bcf5a4f29b950f877626" }
 flate2 = { version = "1", default-features = false, features = ["zlib-rs"] }
 futures = "0.3"
 hex = "0.4"
