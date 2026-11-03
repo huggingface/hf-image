@@ -3,6 +3,10 @@ use hf_image_helper::containerd::Store;
 use hf_image_helper::op::Op;
 use tracing_subscriber::EnvFilter;
 
+/// musl's allocator maps and unmaps every large buffer: transfers spent most of their CPU in it.
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 /// The data plane of `hf image`, run by the CLI as a container next to the Docker daemon.
 #[derive(Parser)]
 #[command(name = "hf-image-helper", version)]

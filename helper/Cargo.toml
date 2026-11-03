@@ -16,6 +16,7 @@ containerd-client = "0.9"
 flate2 = { version = "1", default-features = false, features = ["zlib-rs"] }
 futures = "0.3"
 hex = "0.4"
+mimalloc = "0.1"
 prost-types = "0.14"
 reqwest = { version = "0.13", default-features = false, features = ["json", "rustls", "stream", "query", "http2"] }
 serde = { version = "1", features = ["derive"] }
