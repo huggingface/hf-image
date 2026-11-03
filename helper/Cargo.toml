@@ -2,7 +2,7 @@
 name = "hf-image-helper"
 version = "0.4.0"
 edition = "2024"
-rust-version = "1.89"
+rust-version = "1.95"
 publish = false
 description = "The data plane of `hf image`: Xet transfers, containerd and the build endpoint, next to the Docker daemon"
 
@@ -12,7 +12,7 @@ async-trait = "0.1"
 axum = "0.8"
 bytes = "1"
 clap = { version = "4", features = ["derive", "env"] }
-containerd-client = { git = "https://github.com/containerd/rust-extensions", rev = "d3960fa56ad1dc6cc161bcf5a4f29b950f877626" }
+containerd-client = { git = "https://github.com/containerd/rust-extensions", rev = "96f196dd5aad5e4789b74dba1d313c805fb742e5" }
 flate2 = { version = "1", default-features = false, features = ["zlib-rs"] }
 futures = "0.3"
 hex = "0.4"
