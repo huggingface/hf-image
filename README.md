@@ -71,6 +71,7 @@ its logs.
 | Variable | Default | |
 |---|---|---|
 | `HF_IMAGE_CONCURRENCY` | 6 | layers transferred at once |
+| `HF_IMAGE_CHUNK_CACHE_BYTES` | 0 (off) | Xet chunk cache for pulls, in bytes: re-pulls of rebuilt layers get cheaper, cold pulls slower |
 | `HF_IMAGE_CACHE_VOLUME` | `hf-image-cache` | named volume for the helper's Xet caches |
 | `HF_IMAGE_HELPER_IMAGE` | pinned for each version | the helper image |
 | `HF_IMAGE_CONTAINERD_ADDRESS` | from `docker info` | containerd's socket, on the daemon's host |
