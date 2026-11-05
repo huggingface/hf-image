@@ -6,6 +6,7 @@
 //! it makes re-pulls of rebuilt layers cheaper, but a cold pull writes every layer twice.
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use anyhow::{Context, bail};
 use async_trait::async_trait;
@@ -13,6 +14,9 @@ use bytes::Bytes;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use xet_client::cas_client::auth::{AuthError, TokenInfo, TokenRefresher};
+use xet_client::cas_types::{ChunkRange, Key};
+use xet_client::chunk_cache::error::ChunkCacheError;
+use xet_client::chunk_cache::{CacheRange, ChunkCache};
 use xet_data::processing::configurations::TranslatorConfig;
 use xet_data::processing::data_client::default_config;
 use xet_data::processing::{
@@ -72,9 +76,11 @@ impl Xet {
     pub async fn downloader(&self) -> anyhow::Result<Downloader> {
         let size: u64 = std::env::var("HF_IMAGE_CHUNK_CACHE_BYTES").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
         let dir = xet_cache_root().join("chunk-cache");
+        let counts = Arc::new(CacheCounts::default());
         let cache = if size > 0 {
             let cfg = CacheConfig { cache_directory: dir, cache_size: size };
-            Some(get_cache(&self.ctx.config, &cfg).context("failed to open the chunk cache")?)
+            let inner = get_cache(&self.ctx.config, &cfg).context("failed to open the chunk cache")?;
+            Some(Arc::new(CountedCache { inner, counts: counts.clone() }) as Arc<dyn ChunkCache>)
         } else {
             Self::drop_chunk_cache(dir);
             None
@@ -82,7 +88,7 @@ impl Xet {
         let session = FileDownloadSession::new(self.config(false).await?, cache)
             .await
             .context("failed to open a download session")?;
-        Ok(Downloader { session })
+        Ok(Downloader { session, counts })
     }
 
     /// Removes a chunk cache left in `dir` (up to 20 GB from earlier versions), in the background.
@@ -94,6 +100,36 @@ impl Xet {
                 }
             });
         }
+    }
+}
+
+/// Uncompressed bytes the chunk cache served, and that downloads added to it (everything
+/// fetched from the network while the cache is on).
+#[derive(Default)]
+pub struct CacheCounts {
+    pub served: AtomicU64,
+    pub added: AtomicU64,
+}
+
+/// The chunk cache, counting what goes through it.
+struct CountedCache {
+    inner: Arc<dyn ChunkCache>,
+    counts: Arc<CacheCounts>,
+}
+
+#[async_trait]
+impl ChunkCache for CountedCache {
+    async fn get(&self, key: &Key, range: &ChunkRange) -> Result<Option<CacheRange>, ChunkCacheError> {
+        let hit = self.inner.get(key, range).await?;
+        if let Some(h) = &hit {
+            self.counts.served.fetch_add(h.data.len() as u64, Ordering::Relaxed);
+        }
+        Ok(hit)
+    }
+
+    async fn put(&self, key: &Key, range: &ChunkRange, offsets: &[u32], data: &[u8]) -> Result<(), ChunkCacheError> {
+        self.counts.added.fetch_add(data.len() as u64, Ordering::Relaxed);
+        self.inner.put(key, range, offsets, data).await
     }
 }
 
@@ -124,10 +160,19 @@ impl Uploader {
     }
 
     /// Uploads the remaining data and file metadata; files are readable (and registrable) after.
-    pub async fn finalize(self) -> anyhow::Result<()> {
-        self.session.finalize().await.context("upload commit failed")?;
-        Ok(())
+    pub async fn finalize(self) -> anyhow::Result<Sent> {
+        let m = self.session.finalize().await.context("upload commit failed")?;
+        Ok(Sent { bytes: m.total_bytes_uploaded, total: m.total_bytes, deduplicated: m.deduped_bytes })
     }
+}
+
+/// What an upload session sent, and what Xet had already.
+pub struct Sent {
+    /// Bytes sent to Xet, compressed.
+    pub bytes: u64,
+    /// File bytes uploaded, and of those, the bytes Xet had already.
+    pub total: u64,
+    pub deduplicated: u64,
 }
 
 enum Msg {
@@ -162,9 +207,27 @@ impl FileUpload {
 
 pub struct Downloader {
     session: Arc<FileDownloadSession>,
+    counts: Arc<CacheCounts>,
 }
 
 impl Downloader {
+    /// Network bytes received so far, compressed; chunk cache hits count as received, at the
+    /// size they would have had on the network.
+    pub fn received(&self) -> impl Fn() -> u64 + Send + 'static {
+        let session = self.session.clone();
+        move || session.report().total_transfer_bytes_completed
+    }
+
+    /// Network bytes the downloads need, as far as their plans are known.
+    pub fn needed(&self) -> impl Fn() -> u64 + Send + 'static {
+        let session = self.session.clone();
+        move || session.report().total_transfer_bytes
+    }
+
+    pub fn cache(&self) -> &CacheCounts {
+        &self.counts
+    }
+
     pub async fn stream(&self, hash: &str, size: u64) -> anyhow::Result<DownloadStream> {
         let info = XetFileInfo::new(hash.to_string(), size);
         let (_, stream) = self.session.download_stream(&info, None).await.context("failed to start a download")?;
