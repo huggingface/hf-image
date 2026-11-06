@@ -54,6 +54,34 @@ directory must be shared with the VM, and writable for `pull -o`.
 The Hugging Face token goes on the helper's stdin, never on a command line, in its environment or in
 its logs.
 
+## containerd snapshotter (experimental)
+
+For hosts where containerd pulls images itself (Kubernetes nodes): `hf-image-helper snapshotter` is
+a proxy snapshotter that streams every layer of a `cr.hf.co` image from Xet at once and unpacks it
+straight into its snapshot. Layers skip containerd's content store, so each byte is written once.
+CRI pulls of other registries, and pulls without CRI's snapshot labels, unpack as usual.
+
+Layers are unpacked by [`hf-image-apply`](applier) (Go), found next to the helper binary:
+containerd's own applier, with the options of its overlayfs snapshotter, in its own process.
+
+```toml
+# /etc/containerd/config.toml
+[proxy_plugins.hf]
+  type = "snapshot"
+  address = "/run/hf-image/snapshotter.sock"
+
+[plugins."io.containerd.cri.v1.images"]
+  snapshotter = "hf"
+  disable_snapshot_annotations = false
+```
+
+```console
+# (printf '%s\n' "$HF_TOKEN"; sleep infinity) |
+    hf-image-helper snapshotter --socket /run/hf-image/snapshotter.sock --root /var/lib/hf-image
+```
+
+Snapshot records live in memory: a restart of the snapshotter forgets the images it unpacked.
+
 ## Requirements
 
 - Docker with the [containerd image store](https://docs.docker.com/engine/storage/containerd/)
@@ -84,6 +112,7 @@ its logs.
 ```console
 $ uv run ruff check && uv run pytest                                     # the CLI
 $ cd helper && cargo clippy --all-targets -- -D warnings && cargo test   # the helper (needs protoc)
+$ cd applier && go vet ./... && go test -c -o applier.test . && sudo ./applier.test   # hf-image-apply (Linux, root)
 $ DOCKER_BUILD=1 scripts/helper-image.sh                                 # hf-image-helper:dev, built in your daemon
 $ export HF_IMAGE_HELPER_IMAGE=hf-image-helper:dev
 $ scripts/dev-install.sh                                                 # `hf image` runs this checkout

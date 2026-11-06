@@ -20,3 +20,14 @@ updates:
       actions:
         patterns:
           - "*"
+  - package-ecosystem: "gomod"
+    directory: "/applier"
+    schedule:
+      interval: "weekly"
+    cooldown:
+      default-days: 7
+    # containerd's fixes to its applier reach hf-image-apply only through this module.
+    groups:
+      go:
+        patterns:
+          - "*"
