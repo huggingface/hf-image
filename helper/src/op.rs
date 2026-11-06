@@ -17,6 +17,7 @@ use crate::pull::{PullOpts, Target, pull};
 use crate::push::{Origin, PushOpts, push};
 use crate::reference::ImageRef;
 use crate::registry::{Refused, Registry};
+use crate::snapshotter::Snapshotter;
 use crate::xet::Xet;
 
 #[derive(Debug, Clone, Subcommand)]
@@ -48,6 +49,19 @@ pub enum Op {
     Delete { image: String },
     /// Deletes a tag; prints the digest it pointed to.
     Untag { image: String },
+    /// Serves a containerd proxy snapshotter that unpacks layers straight from Xet.
+    Snapshotter {
+        #[arg(long)]
+        socket: PathBuf,
+        #[arg(long)]
+        root: PathBuf,
+        /// Registries whose layers are pulled from Xet.
+        #[arg(long, default_value = "cr.hf.co")]
+        registry: Vec<String>,
+        /// `hf-image-apply`, which unpacks layers with containerd's applier (default: next to this binary).
+        #[arg(long)]
+        applier: Option<PathBuf>,
+    },
 }
 
 impl Op {
@@ -111,6 +125,16 @@ impl Op {
                 let manifest = registry.manifest(&tag).await?.with_context(|| format!("{image} not found"))?;
                 registry.delete(&tag).await.map_err(|e| Self::refused(e, "untag", &image))?;
                 Self::print_digest(&manifest.digest);
+            }
+            Op::Snapshotter { socket, root, registry, applier } => {
+                let applier = match applier {
+                    Some(applier) => applier,
+                    None => std::env::current_exe()?.with_file_name("hf-image-apply"),
+                };
+                let serving = Snapshotter::new(root, token, registry, applier)?.serve(&socket).await?;
+                eprintln!("snapshotter listening on {}", socket.display());
+                host.stopped().await;
+                serving.abort();
             }
         }
         Ok(())

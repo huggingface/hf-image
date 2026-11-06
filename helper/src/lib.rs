@@ -11,5 +11,7 @@ pub mod pull;
 pub mod push;
 pub mod reference;
 pub mod registry;
+pub mod snapshotter;
+pub mod untar;
 pub mod util;
 pub mod xet;
