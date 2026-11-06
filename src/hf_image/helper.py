@@ -9,6 +9,7 @@ import json
 import os
 import subprocess
 import sys
+import threading
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -90,30 +91,42 @@ class Helper:
             # On failure, `docker run` pulls it with the user's credentials and reports why.
             subprocess.run(["docker", "pull", "-q", self.image], env=env, capture_output=True)
 
-    def start(self, op: list[str], token: str | None, layout: Layout | None = None) -> Running:
-        """Starts `op` and hands it the token."""
+    def start(
+        self, op: list[str], token: str | None, layout: Layout | None = None, progress: Progress | None = None
+    ) -> Running:
+        """Starts `op` and hands it the token; with `progress`, its stderr is printed above it."""
         try:
             self.fetch()
             proc = subprocess.Popen(
-                self.command(op, layout), stdin=subprocess.PIPE, stdout=subprocess.PIPE, encoding="utf-8"
+                self.command(op, layout),
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE if progress else None,
+                encoding="utf-8",
+                errors="replace",
             )
         except FileNotFoundError as e:
             raise click.ClickException("failed to run docker (is Docker installed?)") from e
-        running = Running(proc)
+        running = Running(proc, progress)
         running.send(token or "")
         return running
 
     def run(self, op: list[str], token: str | None, layout: Layout | None = None) -> dict:
-        """Runs `op` to completion; returns its result."""
-        with self.start(op, token, layout) as running:
-            return running.result(running.wait(Progress()))
+        """Runs `op` to completion, drawing its progress; returns its result."""
+        with self.start(op, token, layout, Progress()) as running:
+            return running.result(running.wait())
 
 
 class Running:
     """A helper container at work; leaving its `with` block stops it."""
 
-    def __init__(self, proc: subprocess.Popen):
+    def __init__(self, proc: subprocess.Popen, progress: Progress | None = None):
         self.proc = proc
+        self.progress = progress
+        self.logs: threading.Thread | None = None
+        if progress and proc.stderr:
+            self.logs = threading.Thread(target=self.forward, args=(progress,), daemon=True)
+            self.logs.start()
 
     def __enter__(self) -> Running:
         return self
@@ -147,16 +160,21 @@ class Running:
         self.send("")
         return self.wait()
 
-    def wait(self, progress: Progress | None = None) -> list[str]:
-        """The rest of what the helper prints, its progress drawn by `progress`."""
+    def wait(self) -> list[str]:
+        """The rest of what the helper prints, its progress drawn."""
         lines = []
         for line in self.proc.stdout:
             line = line.rstrip("\n")
-            if progress and line.startswith("{") and progress.event(Running.parse(line)):
+            if self.progress and line.startswith("{") and self.progress.event(Running.parse(line)):
                 continue
             lines.append(line)
         self.exit()
         return lines
+
+    def forward(self, progress: Progress) -> None:
+        """Prints the helper's stderr above `progress`."""
+        for line in self.proc.stderr:
+            progress.log(line.rstrip("\n"))
 
     @staticmethod
     def parse(line: str) -> dict:
@@ -182,6 +200,8 @@ class Running:
     def exit(self) -> None:
         self.close()
         code = self.proc.wait()
+        if self.logs:
+            self.logs.join()
         if code == 0:
             return
         if code == 125:

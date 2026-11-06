@@ -19,7 +19,7 @@ use tokio::sync::{Mutex, mpsc};
 
 use crate::containerd::{Containerd, Store};
 use crate::oci::{self, Compression, Descriptor, Index, Manifest, diff_ids, is_index, sha256};
-use crate::progress::Progress;
+use crate::progress::{self, Bar, Layer};
 use crate::reference::ImageRef;
 use crate::registry::{Registration, Registry};
 use crate::util;
@@ -121,10 +121,8 @@ fn tokio_util_stream(f: tokio::fs::File) -> impl futures::Stream<Item = anyhow::
 
 #[derive(Default)]
 struct Totals {
-    layers: usize,
-    new_layers: usize,
-    read: u64,
-    new_bytes: u64,
+    /// Bytes of the layers in the registry already.
+    existing: u64,
     registrations: Vec<Registration>,
 }
 
@@ -137,28 +135,37 @@ pub async fn push(opts: &PushOpts) -> anyhow::Result<String> {
     let registry = Registry::new(&opts.image, opts.token.clone(), true)?;
     let xet = Xet::new(registry.clone())?;
     let uploader = xet.uploader().await?;
+    progress::image(&opts.image.tagged(), "up");
+    let moved = Bar::default();
+    let meter = moved.meter();
     let totals = Mutex::new(Totals::default());
-    let ctx = Ctx { source: source.as_ref(), registry: &registry, uploader: &uploader, totals: &totals };
-    let plan = if opts.preserve_digests { ctx.preserve().await? } else { ctx.convert().await? };
-
-    Progress::image("Finishing the upload");
-    uploader.finalize().await?;
+    let ctx = Ctx { source: source.as_ref(), registry: &registry, uploader: &uploader, totals: &totals, moved: &moved };
+    let plan = match if opts.preserve_digests { ctx.preserve().await } else { ctx.convert().await } {
+        Ok(plan) => {
+            progress::status("Finishing the upload");
+            uploader.finalize().await.map(|sent| (plan, sent))
+        }
+        Err(e) => Err(e),
+    };
+    let read = meter.finish().await;
+    let upload_secs = read.first.map_or(0.0, |f| f.elapsed().as_secs_f64());
+    let (plan, sent) = plan?;
     let totals = totals.into_inner();
     registry.register(&totals.registrations).await?;
     for (digest, media_type, bytes) in &plan.children {
         registry.put_manifest(digest, bytes, media_type).await?;
     }
     let digest = registry.put_manifest(&opts.image.tag_or_latest(), &plan.top, &plan.top_type).await?;
-    eprintln!(
-        "pushed {} ({}) in {}: {} layers, {} new; {} read, {} new after dedup",
-        opts.image.tagged(),
-        &digest[..19],
-        util::secs(start.elapsed()),
-        totals.layers,
-        totals.new_layers,
-        util::bytes(totals.read),
-        util::bytes(totals.new_bytes),
-    );
+    progress::summary(serde_json::json!({
+        "name": opts.image.tagged(),
+        "secs": start.elapsed().as_secs_f64(),
+        "layers": moved.total(),
+        "existing": totals.existing,
+        "processed": sent.total,
+        "deduplicated": sent.deduplicated,
+        "wire": sent.bytes,
+        "wire_secs": upload_secs,
+    }));
     Ok(digest)
 }
 
@@ -239,6 +246,7 @@ struct Ctx<'a> {
     registry: &'a Arc<Registry>,
     uploader: &'a Uploader,
     totals: &'a Mutex<Totals>,
+    moved: &'a Bar,
 }
 
 impl Ctx<'_> {
@@ -294,11 +302,15 @@ impl Ctx<'_> {
     /// The image as stored: every blob and manifest byte for byte.
     async fn preserve(&self) -> anyhow::Result<Plan> {
         let (plan, blobs) = Plan::verbatim(self.source).await?;
-        for d in blobs.iter().filter(|d| oci::is_layer(&d.media_type)) {
-            Progress::new(&d.digest, Some(d.size)).status("Waiting");
-        }
+        let blobs: Vec<_> = blobs
+            .into_iter()
+            .map(|d| {
+                let layer = oci::is_layer(&d.media_type).then(|| self.moved.layer(&d.digest, d.size));
+                (d, layer)
+            })
+            .collect();
         futures::stream::iter(blobs.iter().map(anyhow::Ok))
-            .try_for_each_concurrent(util::concurrency(), |d| self.raw_blob(d))
+            .try_for_each_concurrent(util::concurrency(), |(d, layer)| self.raw_blob(d, layer.as_ref()))
             .await?;
         Ok(plan)
     }
@@ -312,13 +324,18 @@ impl Ctx<'_> {
             bail!("the config lists {} layers, the manifest {}", diffs.len(), m.layers.len());
         }
         self.small_blob(&m.config.digest, config).await?;
-        for (l, d) in m.layers.iter().zip(&diffs).filter(|(l, _)| oci::is_layer(&l.media_type)) {
-            Progress::new(d, Some(l.size)).status("Waiting");
-        }
-        let sizes: Vec<_> = futures::stream::iter(m.layers.iter().zip(diffs.iter()).map(|(l, d)| self.layer(l, d)))
-            .buffered(util::concurrency())
-            .collect()
-            .await;
+        let progress: Vec<_> = m
+            .layers
+            .iter()
+            .zip(&diffs)
+            .map(|(l, d)| oci::is_layer(&l.media_type).then(|| self.moved.layer(d, l.size)))
+            .collect();
+        let sizes: Vec<_> = futures::stream::iter(
+            m.layers.iter().zip(diffs.iter()).zip(&progress).map(|((l, d), p)| self.layer(l, d, p.as_ref())),
+        )
+        .buffered(util::concurrency())
+        .collect()
+        .await;
         let sizes = sizes.into_iter().collect::<anyhow::Result<Vec<_>>>()?;
         m.to_tar(&diffs, sizes);
         Ok((oci::OCI_MANIFEST.into(), Plan::unchanged(bytes, serde_json::to_vec(&m)?)))
@@ -341,30 +358,27 @@ impl Ctx<'_> {
     }
 
     /// Uploads a blob as stored unless the registry has it, checking its digest and size.
-    async fn raw_blob(&self, d: &Descriptor) -> anyhow::Result<()> {
-        let layer = oci::is_layer(&d.media_type);
-        if layer {
-            self.totals.lock().await.layers += 1;
-        }
-        let progress = layer.then(|| Progress::new(&d.digest, Some(d.size)));
+    async fn raw_blob(&self, d: &Descriptor, progress: Option<&Layer>) -> anyhow::Result<()> {
         if self.registry.blob(&d.digest).await?.is_some() {
-            if let Some(p) = &progress {
-                p.status("Layer already exists");
+            if let Some(p) = progress {
+                p.state("exists");
+                self.moved.add(d.size);
+                self.totals.lock().await.existing += d.size;
             }
             return Ok(());
         }
         let mut stream = self.source.read(&d.digest).await?;
         let mut up = self.uploader.file(&d.digest, Some(d.size))?;
         let (mut hasher, mut size) = (Sha256::new(), 0u64);
-        if let Some(p) = &progress {
-            p.start("Pushing");
+        if let Some(p) = progress {
+            p.state("uploading");
         }
         while let Some(b) = stream.next().await {
             let b = b?;
             hasher.update(&b);
             size += b.len() as u64;
-            if let Some(p) = &progress {
-                p.advance("Pushing", b.len() as u64);
+            if progress.is_some() {
+                self.moved.add(b.len() as u64);
             }
             up.write(b).await?;
         }
@@ -373,13 +387,10 @@ impl Ctx<'_> {
             bail!("blob {} is {digest} ({size} bytes) locally, the manifest says {} bytes", d.digest, d.size);
         }
         let done = up.finish().await?;
-        if let Some(p) = &progress {
-            p.status("Pushed");
+        if let Some(p) = progress {
+            p.state("done");
         }
         let mut t = self.totals.lock().await;
-        t.new_layers += usize::from(layer);
-        t.read += size;
-        t.new_bytes += done.new_bytes;
         t.registrations.push(Registration { digest, xet_hash: done.hash, size });
         Ok(())
     }
@@ -393,49 +404,45 @@ impl Ctx<'_> {
         up.write(bytes).await?;
         let done = up.finish().await?;
         let mut t = self.totals.lock().await;
-        t.new_bytes += done.new_bytes;
         t.registrations.push(Registration { digest: digest.into(), xet_hash: done.hash, size });
         Ok(())
     }
 
     /// Returns the uploaded (or already present) tar size of a layer.
-    async fn layer(&self, layer: &Descriptor, diff_id: &str) -> anyhow::Result<u64> {
-        self.totals.lock().await.layers += 1;
-        if !oci::is_layer(&layer.media_type) {
+    async fn layer(&self, layer: &Descriptor, diff_id: &str, progress: Option<&Layer>) -> anyhow::Result<u64> {
+        let Some(progress) = progress else {
             let blob = self.source.read_all(&layer.digest).await?;
             let size = blob.len() as u64;
             self.small_blob(&layer.digest, blob).await?;
             return Ok(size);
-        }
-        let progress = Progress::new(diff_id, Some(layer.size));
+        };
         if let Some(existing) = self.registry.blob(diff_id).await? {
-            progress.status("Layer already exists");
+            progress.state("exists");
+            self.moved.add(layer.size);
+            self.totals.lock().await.existing += layer.size;
             return existing.size.with_context(|| format!("the registry gave no size for layer {diff_id}"));
         }
         let stream = self.source.read(&layer.digest).await?;
         let upload = self.uploader.file(diff_id, None)?;
-        progress.start("Pushing");
-        let (digest, size, read, done) = decode_into(stream, upload, &progress).await?;
+        progress.state("uploading");
+        let (digest, size, done) = decode_into(stream, upload, self.moved).await?;
         if digest != diff_id {
             bail!("layer {} decompresses to {digest}, the config says {diff_id}", layer.digest);
         }
-        progress.status("Pushed");
+        progress.state("done");
         let mut t = self.totals.lock().await;
-        t.new_layers += 1;
-        t.read += read;
-        t.new_bytes += done.new_bytes;
         t.registrations.push(Registration { digest, xet_hash: done.hash, size });
         Ok(size)
     }
 }
 
 /// Decompresses a layer (gzip, zstd or plain tar, by magic) into an upload, hashing the tar.
-/// Returns (tar digest, tar size, bytes read, upload).
+/// Returns (tar digest, tar size, upload); counts the bytes it reads on `read`.
 async fn decode_into(
     mut stream: BoxStream<'static, anyhow::Result<Bytes>>,
     mut upload: FileUpload,
-    progress: &Progress,
-) -> anyhow::Result<(String, u64, u64, crate::xet::Uploaded)> {
+    read: &Bar,
+) -> anyhow::Result<(String, u64, crate::xet::Uploaded)> {
     let (in_tx, in_rx) = mpsc::channel::<Bytes>(8);
     let (out_tx, mut out_rx) = mpsc::channel::<Bytes>(4);
     let decoder = tokio::task::spawn_blocking(move || -> anyhow::Result<(String, u64)> {
@@ -467,17 +474,15 @@ async fn decode_into(
         Ok((format!("sha256:{}", hex::encode(hasher.finalize())), size))
     });
     let feed = async {
-        let mut read = 0u64;
         while let Some(b) = stream.next().await {
             let b = b?;
-            read += b.len() as u64;
-            progress.advance("Pushing", b.len() as u64);
+            read.add(b.len() as u64);
             if in_tx.send(b).await.is_err() {
                 break;
             }
         }
         drop(in_tx);
-        anyhow::Ok(read)
+        anyhow::Ok(())
     };
     // Owns `out_rx`: a failed upload closes the channel, which stops the decoder, then `feed`.
     let up = &mut upload;
@@ -487,12 +492,12 @@ async fn decode_into(
         }
         anyhow::Ok(())
     };
-    let (read, drained) = tokio::join!(feed, drain);
-    let read = read?;
+    let (fed, drained) = tokio::join!(feed, drain);
+    fed?;
     drained?;
     let (digest, size) = decoder.await??;
     let done = upload.finish().await?;
-    Ok((digest, size, read, done))
+    Ok((digest, size, done))
 }
 
 fn read_up_to(r: &mut impl Read, buf: &mut [u8]) -> std::io::Result<usize> {

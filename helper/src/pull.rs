@@ -5,16 +5,17 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 use std::time::Instant;
 
 use anyhow::{Context, bail};
 use bytes::Bytes;
-use futures::StreamExt;
+use futures::{StreamExt, TryStreamExt};
 use tokio::io::AsyncReadExt;
 
 use crate::containerd::Containerd;
 use crate::oci::{self, Descriptor, Index, Manifest, Platform, chain_ids, diff_ids, is_index};
-use crate::progress::Progress;
+use crate::progress::{self, Bar, Layer, Meter};
 use crate::reference::ImageRef;
 use crate::registry::{BlobInfo, Registry};
 use crate::util::{self, xet_stream};
@@ -73,17 +74,31 @@ pub async fn pull(opts: PullOpts) -> anyhow::Result<String> {
     // Independent round trips, overlapped.
     let (resolved, downloader) = tokio::try_join!(resolve(&registry, &opts.image, &opts.platform), xet.downloader())?;
     let downloader = Arc::new(downloader);
-    let (layers, fetched) = match opts.target {
-        Target::Layout(dir) => into_layout(&dir, &registry, &downloader, &opts.image, &resolved).await?,
-        Target::Store(cd) => into_containerd(cd, &registry, &downloader, &opts.image, &resolved).await?,
+    progress::image(&name, "down");
+    let bar = Bar::default();
+    let (meter, network) = (bar.meter(), Meter::start("network", downloader.received(), downloader.needed()));
+    let written = match opts.target {
+        Target::Layout(dir) => into_layout(&dir, &registry, &downloader, &bar, &opts.image, &resolved).await,
+        Target::Store(cd) => into_containerd(cd, &registry, &downloader, &bar, &opts.image, &resolved).await,
     };
-    let layer_bytes = resolved.manifest.layers.iter().map(|l| l.size).sum();
-    eprintln!(
-        "pulled {name} ({}) in {}: {layers} layers ({}), {fetched} fetched",
-        short(&resolved.top.digest),
-        util::secs(start.elapsed()),
-        util::bytes(layer_bytes),
-    );
+    meter.finish().await;
+    let moved = network.finish().await;
+    let local = written?;
+    let (served, added) =
+        (downloader.cache().served.load(Ordering::Relaxed), downloader.cache().added.load(Ordering::Relaxed));
+    // Cache hits count as received, at their network size: the network share is in proportion.
+    let wire =
+        if served == 0 { moved.bytes } else { (moved.bytes as u128 * added as u128 / (added + served) as u128) as u64 };
+    progress::summary(serde_json::json!({
+        "name": name,
+        "secs": start.elapsed().as_secs_f64(),
+        "layers": resolved.manifest.layers.iter().map(|l| l.size).sum::<u64>(),
+        "local": local,
+        "cached": served,
+        "wire": wire,
+        "wire_exact": served == 0,
+        "wire_secs": moved.secs,
+    }));
     Ok(resolved.top.digest)
 }
 
@@ -92,10 +107,6 @@ pub fn local_name(image: &ImageRef) -> String {
         Some(d) if image.tag.is_none() => format!("{}/{}@{d}", image.registry, image.repo),
         _ => image.tagged(),
     }
-}
-
-fn short(digest: &str) -> &str {
-    &digest[..digest.len().min(19)]
 }
 
 async fn resolve(registry: &Registry, image: &ImageRef, platform: &Platform) -> anyhow::Result<Resolved> {
@@ -154,11 +165,12 @@ async fn into_containerd(
     cd: Containerd,
     registry: &Arc<Registry>,
     downloader: &Arc<Downloader>,
+    bar: &Bar,
     image: &ImageRef,
     r: &Resolved,
-) -> anyhow::Result<(usize, usize)> {
+) -> anyhow::Result<u64> {
     let cd = Arc::new(cd.leased().await?);
-    let result = write_image(&cd, registry, downloader, image, r).await;
+    let result = write_image(&cd, registry, downloader, bar, image, r).await;
     cd.release().await;
     result
 }
@@ -167,9 +179,10 @@ async fn write_image(
     cd: &Arc<Containerd>,
     registry: &Arc<Registry>,
     downloader: &Arc<Downloader>,
+    bar: &Bar,
     image: &ImageRef,
     r: &Resolved,
-) -> anyhow::Result<(usize, usize)> {
+) -> anyhow::Result<u64> {
     let diffs = diff_ids(&r.config)?;
     if diffs.len() != r.manifest.layers.len() {
         bail!("the config lists {} layers, the manifest {}", diffs.len(), r.manifest.layers.len());
@@ -184,10 +197,7 @@ async fn write_image(
     });
     let unpacks = Arc::new(tokio::sync::Semaphore::new(util::concurrency()));
 
-    let progress: Vec<_> = r.manifest.layers.iter().map(|l| Arc::new(Progress::new(&l.digest, Some(l.size)))).collect();
-    for p in &progress {
-        p.status("Waiting");
-    }
+    let progress: Vec<_> = r.manifest.layers.iter().map(|l| Arc::new(bar.layer(&l.digest, l.size))).collect();
 
     // Each layer resolves to whether it was fetched, and the key of the snapshot it was unpacked into.
     let mut layers = Vec::new();
@@ -205,15 +215,16 @@ async fn write_image(
                 return anyhow::Ok((fetched, None));
             }
             let _permit = unpacks.acquire_owned().await?;
-            p.status("Extracting");
+            p.state("extracting");
             let started = Instant::now();
             let key = cd.apply(&(&layer).into(), &diff, &chain, None, i > 0).await?;
             tracing::debug!(layer = %layer.digest, secs = started.elapsed().as_secs_f64(), "unpacked");
+            p.state("done");
             Ok((fetched, Some(key)))
         }));
     }
     // Committed, or unpacked, in chain order.
-    let mut fetched = 0;
+    let mut local = 0;
     let mut keys = Vec::new();
     let mut result = Ok(());
     for (i, (task, layer)) in layers.into_iter().zip(&r.manifest.layers).enumerate() {
@@ -227,16 +238,20 @@ async fn write_image(
         let parent = i.checked_sub(1).map(|p| chains[p].as_str());
         result = async {
             let (f, key) = done?;
-            fetched += usize::from(f);
-            let unpacked = match key {
-                Some(key) => cd.commit(&key, &chains[i], parent).await?,
-                None if cd.snapshot_exists(&chains[i]).await? => false,
-                None => {
-                    progress[i].status("Extracting");
-                    cd.unpack(&layer.into(), &diffs[i], &chains[i], parent).await?
+            if !f {
+                local += layer.size;
+            }
+            match key {
+                Some(key) => {
+                    cd.commit(&key, &chains[i], parent).await?;
                 }
-            };
-            progress[i].status(if f || unpacked { "Pull complete" } else { "Already exists" });
+                None if cd.snapshot_exists(&chains[i]).await? => progress[i].state(if f { "done" } else { "local" }),
+                None => {
+                    progress[i].state("extracting");
+                    cd.unpack(&layer.into(), &diffs[i], &chains[i], parent).await?;
+                    progress[i].state("done");
+                }
+            }
             anyhow::Ok(())
         }
         .await;
@@ -267,7 +282,7 @@ async fn write_image(
         cd.put(&r.top.digest, r.top_bytes.clone(), labels).await?;
     }
     cd.put_image(&local_name(image), (&r.top).into()).await?;
-    Ok((r.manifest.layers.len(), fetched))
+    Ok(local)
 }
 
 /// Writes a layer into the content store unless it is there; returns whether it was fetched.
@@ -278,24 +293,22 @@ async fn fetch(
     permits: &tokio::sync::Semaphore,
     layer: &Descriptor,
     labels: HashMap<String, String>,
-    progress: &Progress,
+    progress: &Arc<Layer>,
 ) -> anyhow::Result<bool> {
     if cd.info(&layer.digest).await?.is_some() {
+        progress.add(layer.size);
         return Ok(false);
     }
     let _permit = permits.acquire().await?;
-    progress.start("Downloading");
+    progress.state("downloading");
     let started = Instant::now();
     let info = layer_info(registry, layer).await?;
-    let stream = layer_stream(registry, downloader, layer, info).await?;
-    let stream = stream.inspect(|b| {
-        if let Ok(b) = b {
-            progress.advance("Downloading", b.len() as u64);
-        }
-    });
+    let counted = progress.clone();
+    let stream =
+        layer_stream(registry, downloader, layer, info).await?.inspect_ok(move |b| counted.add(b.len() as u64));
     cd.write(&layer.digest, layer.size, labels, stream).await?;
     tracing::debug!(layer = %layer.digest, size = layer.size, secs = started.elapsed().as_secs_f64(), "fetched");
-    progress.status("Download complete");
+    progress.state("downloaded");
     Ok(true)
 }
 
@@ -303,25 +316,32 @@ async fn into_layout(
     dir: &Path,
     registry: &Arc<Registry>,
     downloader: &Arc<Downloader>,
+    bar: &Bar,
     image: &ImageRef,
     r: &Resolved,
-) -> anyhow::Result<(usize, usize)> {
+) -> anyhow::Result<u64> {
     let blobs = dir.join("blobs").join("sha256");
     tokio::fs::create_dir_all(&blobs).await?;
     let path = |digest: &str| blobs.join(digest.trim_start_matches("sha256:"));
-    let mut fetched = 0;
+    let mut local = 0;
     // A blob listed twice (e.g. the empty layer) is written once: concurrent writers race on the rename.
     let mut seen = HashSet::new();
-    let layers: Vec<_> = r.manifest.layers.iter().filter(|l| seen.insert(l.digest.as_str())).cloned().collect();
-    let mut tasks = futures::stream::iter(layers.into_iter().map(|layer| {
+    let layers: Vec<_> = r
+        .manifest
+        .layers
+        .iter()
+        .filter(|l| seen.insert(l.digest.as_str()))
+        .map(|l| (l.clone(), bar.layer(&l.digest, l.size)))
+        .collect();
+    let mut tasks = futures::stream::iter(layers.into_iter().map(|(layer, progress)| {
         let (registry, downloader, target) = (registry.clone(), downloader.clone(), path(&layer.digest));
-        let progress = Progress::new(&layer.digest, Some(layer.size));
         async move {
             if tokio::fs::try_exists(&target).await? {
-                progress.status("Already exists");
-                return anyhow::Ok(false);
+                progress.add(layer.size);
+                progress.state("local");
+                return anyhow::Ok(layer.size);
             }
-            progress.status("Downloading");
+            progress.state("downloading");
             let info = layer_info(&registry, &layer).await?;
             let partial = target.with_extension("partial");
             match info.xet_hash {
@@ -338,13 +358,14 @@ async fn into_layout(
                 bail!("layer {} does not match its digest", layer.digest);
             }
             tokio::fs::rename(&partial, &target).await?;
-            progress.status("Download complete");
-            Ok(true)
+            progress.add(layer.size);
+            progress.state("done");
+            Ok(0)
         }
     }))
     .buffer_unordered(util::concurrency());
     while let Some(done) = tasks.next().await {
-        fetched += usize::from(done?);
+        local += done?;
     }
     tokio::fs::write(path(&r.manifest.config.digest), &r.config).await?;
     tokio::fs::write(path(&r.manifest_desc.digest), &r.manifest_bytes).await?;
@@ -354,7 +375,7 @@ async fn into_layout(
     let index = serde_json::json!({ "schemaVersion": 2, "mediaType": oci::OCI_INDEX, "manifests": [top] });
     tokio::fs::write(dir.join("index.json"), serde_json::to_vec_pretty(&index)?).await?;
     tokio::fs::write(dir.join("oci-layout"), br#"{"imageLayoutVersion":"1.0.0"}"#).await?;
-    Ok((r.manifest.layers.len(), fetched))
+    Ok(local)
 }
 
 async fn file_digest(path: &Path) -> anyhow::Result<String> {
