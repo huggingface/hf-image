@@ -55,10 +55,23 @@ impl ImageRef {
     /// Plain HTTP for loopback registries and those listed in `HF_IMAGE_INSECURE_REGISTRIES`.
     pub fn base_url(&self) -> String {
         let host = self.registry.rsplit_once(':').map_or(self.registry.as_str(), |(h, _)| h);
-        let listed = std::env::var("HF_IMAGE_INSECURE_REGISTRIES")
-            .is_ok_and(|v| v.split(',').any(|r| r.trim().eq_ignore_ascii_case(&self.registry)));
-        let insecure = listed || host == "localhost" || host.starts_with("127.");
+        let insecure = self.listed("HF_IMAGE_INSECURE_REGISTRIES") || host == "localhost" || host.starts_with("127.");
         format!("{}://{}", if insecure { "http" } else { "https" }, self.registry)
+    }
+
+    /// Listed in `HF_IMAGE_TOKEN_REGISTRIES`: gets the HF token besides cr.hf.co.
+    pub fn gets_token(&self) -> bool {
+        self.listed("HF_IMAGE_TOKEN_REGISTRIES")
+    }
+
+    /// In the registries the environment variable `var` lists.
+    fn listed(&self, var: &str) -> bool {
+        std::env::var(var).is_ok_and(|v| self.listed_in(&v))
+    }
+
+    /// In `list`, comma-separated `<host>[:<port>]`, matched whole.
+    fn listed_in(&self, list: &str) -> bool {
+        list.split(',').any(|r| r.trim().eq_ignore_ascii_case(&self.registry))
     }
 }
 
@@ -93,5 +106,14 @@ mod tests {
         assert!(ImageRef::parse("acme/app:v1").is_err(), "no registry");
         assert!(ImageRef::parse("cr.hf.co/app").is_err(), "one segment");
         assert!(ImageRef::parse("cr.hf.co/a/b/c").is_err(), "three segments");
+    }
+
+    #[test]
+    fn registry_lists_match_host_and_port_whole() {
+        let listed = |image: &str| ImageRef::parse(image).unwrap().listed_in("registry.example, Localhost:5000");
+        assert!(listed("localhost:5000/a/b") && listed("registry.example/a/b"));
+        for image in ["localhost:5001/a/b", "evil.localhost:5000/a/b", "localhost/a/b", "registry.example:443/a/b"] {
+            assert!(!listed(image), "{image}");
+        }
     }
 }

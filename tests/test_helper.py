@@ -36,6 +36,7 @@ def test_store_op():
 
 def test_settings_pass_by_name(monkeypatch):
     monkeypatch.setenv("HF_IMAGE_LOG", "debug")
+    monkeypatch.setenv("HF_IMAGE_TOKEN_REGISTRIES", "localhost:5000")
     monkeypatch.setenv("HF_XET_HIGH_PERFORMANCE", "1")
     monkeypatch.setenv("HF_XET_CACHE", "/elsewhere")
     monkeypatch.setenv("HF_IMAGE_CACHE_VOLUME", "my-cache")
@@ -43,7 +44,7 @@ def test_settings_pass_by_name(monkeypatch):
     assert cmd[cmd.index("--network") + 1] == "container:buildx_buildkit_b0"
     assert "my-cache:/cache" in cmd
     names = [cmd[i + 1] for i, a in enumerate(cmd) if a == "-e"]
-    assert names == ["HF_XET_CACHE=/cache", "HF_IMAGE_LOG", "HF_XET_HIGH_PERFORMANCE"]
+    assert names == ["HF_XET_CACHE=/cache", "HF_IMAGE_LOG", "HF_IMAGE_TOKEN_REGISTRIES", "HF_XET_HIGH_PERFORMANCE"]
 
 
 def test_layout_ops(tmp_path: Path):
