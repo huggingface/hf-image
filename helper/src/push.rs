@@ -573,10 +573,10 @@ mod tests {
 
     #[test]
     fn a_no_op_conversion_keeps_the_bytes() {
-        let diff = sha256(b"tar");
+        let (diff, config) = (sha256(b"tar"), sha256(b"{}"));
         let raw = Bytes::from(format!(
             r#"{{ "layers": [{{"size": 3, "digest": "{diff}", "mediaType": "{}"}}],
-                "config": {{"digest": "sha256:c", "size": 2, "mediaType": "{}"}},
+                "config": {{"digest": "{config}", "size": 2, "mediaType": "{}"}},
                 "mediaType": "{}", "schemaVersion": 2 }}"#,
             oci::OCI_LAYER_TAR,
             oci::OCI_CONFIG,
@@ -594,7 +594,7 @@ mod tests {
             serde_json::to_vec(&json!({
                 "schemaVersion": 2,
                 "mediaType": oci::DOCKER_MANIFEST,
-                "config": desc(oci::DOCKER_CONFIG, "sha256:c", 2),
+                "config": desc(oci::DOCKER_CONFIG, &sha256(b"{}"), 2),
                 "layers": [desc("application/vnd.docker.image.rootfs.diff.tar.gzip", &gz, 2)],
             }))
             .unwrap(),

@@ -55,10 +55,11 @@ impl Refused {
     fn parse(body: &str) -> Option<Self> {
         let v: serde_json::Value = serde_json::from_str(body).ok()?;
         let e = v["errors"].get(0)?;
-        let message = e["message"].as_str().unwrap_or_default().trim().to_string();
+        let message = printable(e["message"].as_str().unwrap_or_default().trim());
         let references = serde_json::from_value::<References>(e["detail"].clone())
             .ok()
-            .filter(|r| !r.tags.is_empty() || !r.indexes.is_empty());
+            .filter(|r| !r.tags.is_empty() || !r.indexes.is_empty())
+            .map(References::printable);
         Some(Self { message, references })
     }
 }
@@ -78,6 +79,14 @@ pub struct References {
     pub tags: Vec<String>,
     #[serde(default)]
     pub indexes: Vec<IndexRef>,
+}
+
+impl References {
+    fn printable(self) -> Self {
+        let clean = |names: Vec<String>| names.iter().map(|n| printable(n)).collect();
+        let indexes = self.indexes.into_iter().map(|i| IndexRef { digest: printable(&i.digest), tags: clean(i.tags) });
+        Self { tags: clean(self.tags), indexes: indexes.collect() }
+    }
 }
 
 /// An index listing the manifest, with its own tags.
@@ -167,7 +176,8 @@ impl Registry {
             .to_string();
         let bytes = resp.bytes().await?;
         let digest = sha256(&bytes);
-        if reference.starts_with("sha256:") && reference != digest {
+        // Tags have no `:`: anything else is a digest, and only a matching sha256 one is accepted.
+        if reference.contains(':') && reference != digest {
             bail!("manifest {reference} has digest {digest}");
         }
         Ok(Some(Manifest { bytes, media_type, digest }))
@@ -190,7 +200,7 @@ impl Registry {
             let body = resp.text().await.unwrap_or_default();
             return Err(match Refused::parse(&body) {
                 Some(refused) => refused.into(),
-                None => anyhow::anyhow!("delete: {status}: {}", body.trim()),
+                None => anyhow::anyhow!("delete: {status}: {}", printable(body.trim())),
             });
         }
         check(resp, "delete").await?;
@@ -307,7 +317,7 @@ async fn check(resp: Response, what: &str) -> anyhow::Result<Response> {
     }
     let status = resp.status();
     let body = resp.text().await.unwrap_or_default();
-    let message = oci_error(&body).map(|(_, m)| m).filter(|m| !m.is_empty()).unwrap_or(body);
+    let message = oci_error(&body).map(|(_, m)| m).filter(|m| !m.is_empty()).unwrap_or_else(|| printable(&body));
     bail!("{what}: {status}: {}", message.trim())
 }
 
@@ -315,8 +325,20 @@ async fn check(resp: Response, what: &str) -> anyhow::Result<Response> {
 fn oci_error(body: &str) -> Option<(String, String)> {
     let v: serde_json::Value = serde_json::from_str(body).ok()?;
     let e = v["errors"].get(0)?;
-    let field = |k: &str| e[k].as_str().unwrap_or_default().trim().to_string();
+    let field = |k: &str| printable(e[k].as_str().unwrap_or_default().trim());
     Some((field("code"), field("message")))
+}
+
+/// Registry text made safe for a terminal: line breaks and tabs become spaces, other control
+/// characters U+FFFD.
+fn printable(s: &str) -> String {
+    s.chars()
+        .map(|c| match c {
+            '\n' | '\r' | '\t' => ' ',
+            c if c.is_control() => '\u{fffd}',
+            c => c,
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -383,6 +405,34 @@ mod tests {
         assert_eq!((refused.message.as_str(), refused.references.is_none()), ("manifest unknown", true));
         let err = deleting(StatusCode::METHOD_NOT_ALLOWED, "405 method not allowed").await;
         assert_eq!(err.to_string(), "delete: 405 Method Not Allowed: 405 method not allowed");
+    }
+
+    #[tokio::test]
+    async fn registry_text_reaches_errors_without_control_characters() {
+        let control = |s: &str| s.chars().any(char::is_control);
+        let message = "\u{1b}]0;title\u{7}\u{1b}[2K\r\u{1b}[32mpulled OK\u{1b}[0m\u{9b}31m";
+        let json = serde_json::json!({"errors": [{"code": "DENIED", "message": message}]}).to_string();
+        let manifests = |body: String| {
+            serve(Router::new().route(
+                "/v2/{ns}/{name}/manifests/{reference}",
+                get(move || async move { (StatusCode::BAD_REQUEST, body) }),
+            ))
+        };
+        let err = manifests(json).await.manifest("latest").await.err().unwrap().to_string();
+        assert!(err.contains("pulled OK") && !control(&err), "{err:?}");
+        let err =
+            manifests(format!("<html>{message}</html>")).await.manifest("latest").await.err().unwrap().to_string();
+        assert!(err.contains("pulled OK") && !control(&err), "{err:?}");
+
+        let detail = serde_json::json!({"tags": [message], "indexes": [{"digest": message, "tags": [message]}]});
+        let body =
+            serde_json::json!({"errors": [{"code": "DENIED", "message": message, "detail": detail}]}).to_string();
+        let route = delete(move || async move { (StatusCode::CONFLICT, body) });
+        let err = serve(Router::new().route("/v2/{ns}/{name}/manifests/{reference}", route)).await.delete("v1").await;
+        let refused = err.unwrap_err().downcast::<Refused>().unwrap();
+        let refs = refused.references.unwrap();
+        let texts = [&refused.message, &refs.tags[0], &refs.indexes[0].digest, &refs.indexes[0].tags[0]];
+        assert!(texts.iter().all(|t| t.contains("pulled OK") && !control(t)), "{texts:?}");
     }
 
     #[test]

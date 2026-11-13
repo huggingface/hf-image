@@ -344,18 +344,26 @@ async fn into_layout(
             progress.state("downloading");
             let info = layer_info(&registry, &layer).await?;
             let partial = target.with_extension("partial");
-            match info.xet_hash {
-                Some(h) => downloader.to_file(&h, layer.size, &partial).await?,
-                None => {
-                    let mut out = tokio::fs::File::create(&partial).await?;
-                    let mut s = registry.download(&layer.digest).await?.bytes_stream();
-                    while let Some(b) = s.next().await {
-                        tokio::io::AsyncWriteExt::write_all(&mut out, &b?).await?;
+            let fetched = async {
+                match info.xet_hash {
+                    Some(h) => downloader.to_file(&h, layer.size, &partial).await?,
+                    None => {
+                        let mut out = tokio::fs::File::create(&partial).await?;
+                        let mut s = registry.download(&layer.digest).await?.bytes_stream();
+                        while let Some(b) = s.next().await {
+                            tokio::io::AsyncWriteExt::write_all(&mut out, &b?).await?;
+                        }
                     }
                 }
+                if file_digest(&partial).await? != layer.digest {
+                    bail!("layer {} does not match its digest", layer.digest);
+                }
+                anyhow::Ok(())
             }
-            if file_digest(&partial).await? != layer.digest {
-                bail!("layer {} does not match its digest", layer.digest);
+            .await;
+            if let Err(e) = fetched {
+                let _ = tokio::fs::remove_file(&partial).await;
+                return Err(e);
             }
             tokio::fs::rename(&partial, &target).await?;
             progress.add(layer.size);
@@ -391,4 +399,95 @@ async fn file_digest(path: &Path) -> anyhow::Result<String> {
         hasher.update(&buf[..n]);
     }
     Ok(format!("sha256:{}", hex::encode(hasher.finalize())))
+}
+
+#[cfg(test)]
+mod tests {
+    use axum::Router;
+    use axum::http::{StatusCode, Uri, header};
+    use axum::response::IntoResponse;
+
+    use super::*;
+    use crate::oci::{OCI_CONFIG, OCI_INDEX, OCI_LAYER_TAR, OCI_MANIFEST, sha256};
+
+    type Files = HashMap<String, (&'static str, Vec<u8>)>;
+
+    /// An anonymous Xet registry on loopback serving `files` by path; returns `<it>/acme/app:latest`.
+    async fn registry(files: Files) -> ImageRef {
+        let files = Arc::new(files);
+        let answer = move |uri: Uri| async move {
+            match uri.path() {
+                "/v2/" => StatusCode::OK.into_response(),
+                p if p.ends_with("/_hf/xet-token") => {
+                    let token =
+                        serde_json::json!({"casUrl": "http://127.0.0.1:9", "accessToken": "x", "exp": 4102444800u64});
+                    ([(header::CONTENT_TYPE, "application/json")], token.to_string()).into_response()
+                }
+                p => match files.get(p) {
+                    Some((media_type, body)) => ([(header::CONTENT_TYPE, *media_type)], body.clone()).into_response(),
+                    None => StatusCode::NOT_FOUND.into_response(),
+                },
+            }
+        };
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, Router::new().fallback(answer)).await.unwrap() });
+        ImageRef::parse(&format!("{addr}/acme/app:latest")).unwrap()
+    }
+
+    /// Pulls `image` into the layout `out`.
+    async fn pull_into(image: ImageRef, out: &Path) -> anyhow::Result<String> {
+        let platform = Platform::parse("linux/arm64")?;
+        pull(PullOpts { image, token: None, platform, target: Target::Layout(out.into()), if_stale: false }).await
+    }
+
+    fn temp_dir() -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("pull-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn json(v: serde_json::Value) -> Vec<u8> {
+        serde_json::to_vec(&v).unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_digest_that_is_a_path_writes_nothing() {
+        let root = temp_dir();
+        let child = serde_json::json!({"mediaType": OCI_MANIFEST, "digest": "../../../escaped", "size": 2, "platform": {"os": "linux", "architecture": "arm64"}});
+        let index = json(serde_json::json!({"schemaVersion": 2, "mediaType": OCI_INDEX, "manifests": [child]}));
+        let image = registry(Files::from([("/v2/acme/app/manifests/latest".into(), (OCI_INDEX, index))])).await;
+        let err = pull_into(image, &root.join("out")).await.unwrap_err();
+        assert!(format!("{err:#}").contains("invalid digest"), "{err:#}");
+        assert!(!root.join("escaped").exists() && !root.join("escaped.partial").exists());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_layer_that_does_not_match_its_digest_leaves_no_file() {
+        let root = temp_dir();
+        let config = json(
+            serde_json::json!({"os": "linux", "architecture": "arm64", "rootfs": {"type": "layers", "diff_ids": [sha256(b"layer")]}}),
+        );
+        let (config_digest, layer_digest) = (sha256(&config), sha256(b"layer"));
+        let manifest = json(serde_json::json!({
+            "schemaVersion": 2,
+            "mediaType": OCI_MANIFEST,
+            "config": {"mediaType": OCI_CONFIG, "digest": config_digest, "size": config.len()},
+            "layers": [{"mediaType": OCI_LAYER_TAR, "digest": layer_digest, "size": 5}],
+        }));
+        let image = registry(Files::from([
+            ("/v2/acme/app/manifests/latest".into(), (OCI_MANIFEST, manifest)),
+            (format!("/v2/acme/app/blobs/{config_digest}"), ("application/octet-stream", config.clone())),
+            (format!("/v2/acme/app/blobs/{layer_digest}"), ("application/octet-stream", b"other".to_vec())),
+        ]))
+        .await;
+        let out = root.join("out");
+        let err = pull_into(image, &out).await.unwrap_err();
+        assert!(err.to_string().contains("does not match its digest"), "{err:#}");
+        let left: Vec<_> =
+            std::fs::read_dir(out.join("blobs/sha256")).unwrap().map(|e| e.unwrap().file_name()).collect();
+        assert!(left.is_empty(), "{left:?}");
+        std::fs::remove_dir_all(root).unwrap();
+    }
 }

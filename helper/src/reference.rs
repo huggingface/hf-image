@@ -31,7 +31,7 @@ impl ImageRef {
             bail!("{s:?}: the repository must be <namespace>/<name>");
         }
         if let Some(d) = &digest
-            && (!d.starts_with("sha256:") || d.len() != 71)
+            && !crate::oci::is_digest(d)
         {
             bail!("{s:?}: invalid digest");
         }
@@ -54,9 +54,17 @@ impl ImageRef {
 
     /// Plain HTTP for loopback registries and those listed in `HF_IMAGE_INSECURE_REGISTRIES`.
     pub fn base_url(&self) -> String {
-        let host = self.registry.rsplit_once(':').map_or(self.registry.as_str(), |(h, _)| h);
-        let insecure = self.listed("HF_IMAGE_INSECURE_REGISTRIES") || host == "localhost" || host.starts_with("127.");
+        let insecure = self.loopback() || self.listed("HF_IMAGE_INSECURE_REGISTRIES");
         format!("{}://{}", if insecure { "http" } else { "https" }, self.registry)
+    }
+
+    /// `localhost`, or a loopback IP address (`127.0.0.0/8`, `[::1]`), with or without a port.
+    fn loopback(&self) -> bool {
+        let host = match self.registry.strip_prefix('[') {
+            Some(v6) => v6.split(']').next().unwrap_or_default(),
+            None => self.registry.split(':').next().unwrap_or_default(),
+        };
+        host == "localhost" || host.parse::<std::net::IpAddr>().is_ok_and(|ip| ip.is_loopback())
     }
 
     /// Listed in `HF_IMAGE_TOKEN_REGISTRIES`: gets the HF token besides cr.hf.co.
@@ -106,6 +114,20 @@ mod tests {
         assert!(ImageRef::parse("acme/app:v1").is_err(), "no registry");
         assert!(ImageRef::parse("cr.hf.co/app").is_err(), "one segment");
         assert!(ImageRef::parse("cr.hf.co/a/b/c").is_err(), "three segments");
+        assert!(ImageRef::parse(&format!("cr.hf.co/a/b@sha256:{}", "../".repeat(21) + "x")).is_err(), "not hex");
+    }
+
+    #[test]
+    fn only_loopback_addresses_get_plain_http() {
+        let base = |image: &str| ImageRef::parse(image).unwrap().base_url();
+        for image in ["localhost/a/b", "localhost:5000/a/b", "127.0.0.1:5000/a/b", "127.1.2.3/a/b", "[::1]:5000/a/b"] {
+            assert!(base(image).starts_with("http://"), "{image}");
+        }
+        for image in
+            ["127.attacker.example/a/b", "127.0.0.1.example:5000/a/b", "localhost.example/a/b", "[::2]:5000/a/b"]
+        {
+            assert!(base(image).starts_with("https://"), "{image}");
+        }
     }
 
     #[test]

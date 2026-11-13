@@ -2,7 +2,7 @@
 
 use std::collections::BTreeMap;
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use sha2::{Digest as _, Sha256};
 
 pub const OCI_INDEX: &str = "application/vnd.oci.image.index.v1+json";
@@ -18,6 +18,12 @@ pub const MANIFEST_ACCEPT: &str = "application/vnd.oci.image.index.v1+json, appl
 
 pub fn sha256(data: &[u8]) -> String {
     format!("sha256:{}", hex::encode(Sha256::digest(data)))
+}
+
+/// `sha256:` and 64 lowercase hex digits: the only digest form read from a registry or a layout.
+pub fn is_digest(d: &str) -> bool {
+    d.strip_prefix("sha256:")
+        .is_some_and(|h| h.len() == 64 && h.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')))
 }
 
 pub fn is_index(media_type: &str) -> bool {
@@ -123,6 +129,7 @@ impl std::fmt::Display for Platform {
 #[serde(rename_all = "camelCase")]
 pub struct Descriptor {
     pub media_type: String,
+    #[serde(deserialize_with = "Descriptor::digest")]
     pub digest: String,
     pub size: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -142,6 +149,15 @@ impl Descriptor {
             annotations: None,
             platform: None,
             extra: BTreeMap::new(),
+        }
+    }
+
+    /// Refuses digests that aren't [`is_digest`]: they become blob paths and URLs.
+    fn digest<'de, D: Deserializer<'de>>(d: D) -> Result<String, D::Error> {
+        let digest = String::deserialize(d)?;
+        match is_digest(&digest) {
+            true => Ok(digest),
+            false => Err(serde::de::Error::custom(format!("invalid digest {digest:?}"))),
         }
     }
 }
@@ -263,9 +279,34 @@ mod tests {
     }
 
     #[test]
+    fn descriptors_take_only_sha256_digests() {
+        let valid = sha256(b"x");
+        assert!(is_digest(&valid));
+        let descriptor = |digest: &str| {
+            serde_json::from_value::<Descriptor>(
+                serde_json::json!({"mediaType": OCI_MANIFEST, "digest": digest, "size": 1}),
+            )
+        };
+        assert_eq!(descriptor(&valid).unwrap().digest, valid);
+        for bad in [
+            "../../../x".to_string(),
+            "/etc/passwd".into(),
+            format!("sha256:{}/../x", "a".repeat(60)),
+            valid.to_uppercase().replace("SHA256", "sha256"),
+            format!("sha512:{}", "a".repeat(128)),
+            valid[..70].into(),
+            String::new(),
+        ] {
+            assert!(!is_digest(&bad), "{bad}");
+            let err = descriptor(&bad).unwrap_err().to_string();
+            assert!(err.contains("invalid digest"), "{err}");
+        }
+    }
+
+    #[test]
     fn unknown_fields_survive() {
-        let raw = r#"{"schemaVersion":2,"mediaType":"application/vnd.oci.image.manifest.v1+json","config":{"mediaType":"x","digest":"sha256:00","size":1,"data":"e30="},"layers":[],"annotations":{"k":"v"},"subject":{"mediaType":"m","digest":"d","size":2}}"#;
-        let m: Manifest = serde_json::from_str(raw).unwrap();
+        let raw = r#"{"schemaVersion":2,"mediaType":"application/vnd.oci.image.manifest.v1+json","config":{"mediaType":"x","digest":"sha256:DIGEST","size":1,"data":"e30="},"layers":[],"annotations":{"k":"v"},"subject":{"mediaType":"m","digest":"d","size":2}}"#;
+        let m: Manifest = serde_json::from_str(&raw.replace("sha256:DIGEST", &sha256(b"{}"))).unwrap();
         let back = serde_json::to_value(&m).unwrap();
         assert_eq!(back["annotations"]["k"], "v");
         assert_eq!(back["subject"]["size"], 2);
@@ -274,38 +315,41 @@ mod tests {
 
     #[test]
     fn platform_selection_skips_attestations() {
+        let (att, arm) = (sha256(b"att"), sha256(b"arm"));
         let idx: Index = serde_json::from_value(serde_json::json!({
             "schemaVersion": 2,
             "manifests": [
-                {"mediaType": OCI_MANIFEST, "digest": "sha256:att", "size": 1, "platform": {"os": "unknown", "architecture": "unknown"},
+                {"mediaType": OCI_MANIFEST, "digest": att, "size": 1, "platform": {"os": "unknown", "architecture": "unknown"},
                  "annotations": {"vnd.docker.reference.type": "attestation-manifest"}},
-                {"mediaType": OCI_MANIFEST, "digest": "sha256:arm", "size": 1, "platform": {"os": "linux", "architecture": "arm64"}},
+                {"mediaType": OCI_MANIFEST, "digest": arm, "size": 1, "platform": {"os": "linux", "architecture": "arm64"}},
             ]
         }))
         .unwrap();
-        assert_eq!(idx.select(&Platform::parse("linux/arm64").unwrap()).unwrap().digest, "sha256:arm");
+        assert_eq!(idx.select(&Platform::parse("linux/arm64").unwrap()).unwrap().digest, arm);
         assert!(idx.select(&Platform::parse("linux/amd64").unwrap()).is_none());
     }
 
-    /// An index with one image per `(digest, os/arch[/variant])`.
+    /// An index with one image per `(name, os/arch[/variant])`, named in its annotations.
     fn index(entries: &[(&str, &str)]) -> Index {
         let manifests: Vec<_> = entries
             .iter()
-            .map(|(digest, p)| {
+            .map(|(name, p)| {
                 let mut parts = p.split('/');
                 let (os, arch, variant) = (parts.next().unwrap(), parts.next().unwrap(), parts.next());
                 let mut platform = serde_json::json!({"os": os, "architecture": arch});
                 if let Some(v) = variant {
                     platform["variant"] = v.into();
                 }
-                serde_json::json!({"mediaType": OCI_MANIFEST, "digest": digest, "size": 1, "platform": platform})
+                let (digest, annotations) = (sha256(name.as_bytes()), serde_json::json!({ "name": name }));
+                serde_json::json!({"mediaType": OCI_MANIFEST, "digest": digest, "size": 1, "platform": platform, "annotations": annotations})
             })
             .collect();
         serde_json::from_value(serde_json::json!({"schemaVersion": 2, "manifests": manifests})).unwrap()
     }
 
+    /// The name of the image `idx` selects for `platform`.
     fn pick<'a>(idx: &'a Index, platform: &str) -> Option<&'a str> {
-        idx.select(&Platform::parse(platform).unwrap()).map(|d| d.digest.as_str())
+        idx.select(&Platform::parse(platform).unwrap()).map(|d| d.annotations.as_ref().unwrap()["name"].as_str())
     }
 
     #[test]
