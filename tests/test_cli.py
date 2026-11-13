@@ -1,5 +1,6 @@
 """The commands end to end, against a fake `docker` that records what it is asked."""
 
+import base64
 import json
 import os
 import subprocess
@@ -12,6 +13,7 @@ from .test_docker import INFO
 
 DIGEST = "sha256:" + "a" * 64
 BUILT = "sha256:" + "b" * 64
+GATEWAY_AUTH = base64.b64encode(b"hf-image:s3cr3t").decode()
 FAKE_DOCKER = f"""#!{sys.executable}
 import json, os, sys
 args = sys.argv[1:]
@@ -30,12 +32,19 @@ elif args[:1] == ["run"] and "helper:test" in args:
         print("error: boom", file=sys.stderr)
         sys.exit(code)
     if "serve" in args:
-        print(json.dumps({{"addr": "127.0.0.1:4242", "secret": "s3cr3t"}}), flush=True)
+        print(json.dumps({{"addr": "127.0.0.1:4242", "auth": "{GATEWAY_AUTH}"}}), flush=True)
         sys.stdin.readline()
         summary = {{"pushed": [["v1", "{BUILT}"]], "blobs_uploaded": 2, "blobs_skipped": 3, "bytes_new": 1500000}}
         print(json.dumps(summary))
     else:
         print(json.dumps({{"digest": "{DIGEST}"}}))
+elif args[:2] == ["buildx", "build"]:
+    d = os.environ["DOCKER_CONFIG"]
+    path = os.path.join(d, "config.json")
+    with open(path) as f:
+        config = json.load(f)
+    modes = [oct(os.stat(p).st_mode & 0o777) for p in (d, path)]
+    record(docker_config=d, config=config, modes=modes, entries=sorted(os.listdir(d)))
 else:
     record()
 """
@@ -51,7 +60,7 @@ def hfi(tmp_path: Path):
     log = tmp_path / "docker.log"
     env = {k: v for k, v in os.environ.items() if not k.startswith(("HF_IMAGE_", "HF_XET_", "BUILDX_"))}
     env |= {"PATH": f"{bin_dir}:{env['PATH']}", "FAKE_DOCKER_LOG": str(log), "HF_TOKEN": "hf_test"}
-    env |= {"HF_IMAGE_HELPER_IMAGE": "helper:test"}
+    env |= {"HF_IMAGE_HELPER_IMAGE": "helper:test", "DOCKER_CONFIG": str(tmp_path / "no-docker-config")}
 
     def run(*args: str, **extra_env: str):
         cli = [sys.executable, "-c", "from hf_image.cli import main; main()", *args]
@@ -151,10 +160,31 @@ def test_build(hfi):
     assert "2 blobs uploaded (1.5 MB new after dedup), 3 already there" in done.stderr
     assert op(serve) == ["serve", "cr.hf.co/a/b"]
     output = (
-        "type=image,name=127.0.0.1:4242/s3cr3t/a/b:v1,push=true,registry.insecure=true,"
+        "type=image,name=127.0.0.1:4242/a/b:v1,push=true,registry.insecure=true,"
         "compression=uncompressed,force-compression=true,oci-mediatypes=true"
     )
     assert build["args"] == ["buildx", "build", "--build-arg", "X=1", "ctx", "--output", output]
+
+
+def test_build_hands_the_gateway_credentials_through_a_private_docker_config(hfi, tmp_path: Path):
+    user = tmp_path / "docker-config"
+    (user / "contexts").mkdir(parents=True)
+    (user / "buildx").mkdir()
+    mine = {"currentContext": "desktop-linux", "credsStore": "desktop", "auths": {"ghcr.io": {"auth": "eDp5"}}}
+    (user / "config.json").write_text(json.dumps(mine))
+    _, calls = hfi("build", "-t", "cr.hf.co/a/b:v1", "ctx", DOCKER_CONFIG=str(user))
+    (build,) = [c for c in calls if c["args"][:2] == ["buildx", "build"]]
+    assert build["config"] == {
+        "currentContext": "desktop-linux",
+        "credsStore": "desktop",
+        "auths": {"ghcr.io": {"auth": "eDp5"}, "127.0.0.1:4242": {"auth": GATEWAY_AUTH}},
+        "credHelpers": {"127.0.0.1:4242": ""},
+    }
+    assert build["modes"] == ["0o700", "0o600"]
+    assert build["entries"] == ["buildx", "config.json", "contexts"]
+    assert not Path(build["docker_config"]).exists()
+    assert json.loads((user / "config.json").read_text()) == mine
+    assert not any(GATEWAY_AUTH in a or "s3cr3t" in a for c in calls for a in c["args"])
 
 
 def test_build_sets_its_own_output(hfi):

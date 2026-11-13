@@ -61,12 +61,13 @@ def build(token: str | None, tag: str, args: tuple[str, ...]) -> None:
     serve = ["serve", f"{image.registry}/{image.repo}"]
     with Helper(daemon, builder.network).start(serve, hf_token(token)) as helper:
         endpoint = json.loads(helper.line())
-        gw_name = f"{endpoint['addr']}/{endpoint['secret']}/{image.repo}:{image.tag_or_latest()}"
+        gw_name = f"{endpoint['addr']}/{image.repo}:{image.tag_or_latest()}"
         output = (
             f"type=image,name={gw_name},push=true,registry.insecure=true,"
             "compression=uncompressed,force-compression=true,oci-mediatypes=true"
         )
-        code = docker.run(["buildx", "build", *args, "--output", output])
+        with docker.credentials(endpoint["addr"], endpoint["auth"]) as env:
+            code = docker.run(["buildx", "build", *args, "--output", output], env)
         summary = helper.result(helper.stop())
     if code != 0:
         raise click.ClickException(f"docker buildx build failed (exit code {code})")
