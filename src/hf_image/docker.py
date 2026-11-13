@@ -128,20 +128,45 @@ def image_exists(name: str) -> bool:
     return done.returncode == 0
 
 
-def run(args: list[str]) -> int:
+def run(args: list[str], env: dict[str, str] | None = None) -> int:
     """Runs `docker <args>` with inherited stdio; returns its exit code."""
-    return subprocess.call(["docker", *args])
+    return subprocess.call(["docker", *args], env=env)
 
 
-@contextmanager
-def anonymous() -> Iterator[dict[str, str]]:
-    """An environment where the `docker` CLI sends no registry credentials, on the same context."""
+def user_config() -> tuple[Path, dict]:
+    """The `docker` CLI's config directory, and its config.json (empty when missing or invalid)."""
     user = Path(os.environ.get("DOCKER_CONFIG") or Path.home() / ".docker")
     try:
         config = json.loads((user / "config.json").read_text())
     except (OSError, ValueError):
         config = {}
-    context = config.get("currentContext") if isinstance(config, dict) else None
+    return user, config if isinstance(config, dict) else {}
+
+
+@contextmanager
+def credentials(registry: str, auth: str) -> Iterator[dict[str, str]]:
+    """An environment where the `docker` CLI sends `auth` (a config's base64 `user:password`) to
+    `registry`, from a config only this user can read; the rest of the user's config applies."""
+    user, config = user_config()
+    auths, helpers = config.get("auths"), config.get("credHelpers")
+    config["auths"] = {**(auths if isinstance(auths, dict) else {}), registry: {"auth": auth}}
+    # An empty helper makes the CLI read this registry from `auths`, even with a `credsStore`.
+    config["credHelpers"] = {**(helpers if isinstance(helpers, dict) else {}), registry: ""}
+    with tempfile.TemporaryDirectory(prefix="hf-image-docker-") as tmp:
+        fd = os.open(Path(tmp) / "config.json", os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(fd, "w") as f:
+            json.dump(config, f)
+        for entry in user.iterdir() if user.is_dir() else ():
+            if entry.name != "config.json":
+                (Path(tmp) / entry.name).symlink_to(entry)
+        yield {**os.environ, "DOCKER_CONFIG": tmp}
+
+
+@contextmanager
+def anonymous() -> Iterator[dict[str, str]]:
+    """An environment where the `docker` CLI sends no registry credentials, on the same context."""
+    user, config = user_config()
+    context = config.get("currentContext")
     with tempfile.TemporaryDirectory(prefix="hf-image-docker-") as tmp:
         (Path(tmp) / "config.json").write_text(json.dumps({"currentContext": context} if context else {}))
         if (user / "contexts").is_dir():
