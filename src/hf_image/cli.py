@@ -22,7 +22,11 @@ PASSTHROUGH = {"ignore_unknown_options": True, "allow_interspersed_args": False}
 
 
 @click.group()
-@click.option("--token", help="Hugging Face token (default: HF_TOKEN, then the token `hf auth login` saved).")
+@click.option(
+    "--token",
+    help="Hugging Face token (default: HF_TOKEN, then the token `hf auth login` saved). "
+    "Sent only to cr.hf.co and the registries in HF_IMAGE_TOKEN_REGISTRIES.",
+)
 @click.version_option(package_name="hf-image")
 @click.pass_context
 def cli(ctx: click.Context, token: str | None) -> None:

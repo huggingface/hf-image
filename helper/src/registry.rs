@@ -12,6 +12,8 @@ use crate::auth::Tokens;
 use crate::oci::{MANIFEST_ACCEPT, sha256};
 use crate::reference::ImageRef;
 
+const USER_AGENT: &str = concat!("hf-image/", env!("CARGO_PKG_VERSION"));
+
 #[derive(Debug, Clone)]
 pub struct BlobInfo {
     /// `None` when the registry sends no `Content-Length`.
@@ -101,17 +103,13 @@ pub struct Registry {
 
 impl Registry {
     pub fn new(r: &ImageRef, hf_token: Option<String>, push: bool) -> anyhow::Result<Arc<Self>> {
-        let ua = concat!("hf-image/", env!("CARGO_PKG_VERSION"));
-        let api = reqwest::Client::builder()
-            .redirect(reqwest::redirect::Policy::none())
-            .user_agent(ua)
-            .connect_timeout(Duration::from_secs(15))
-            .build()?;
-        let download = reqwest::Client::builder().user_agent(ua).connect_timeout(Duration::from_secs(15)).build()?;
+        let api = Self::api_client()?;
+        let download =
+            reqwest::Client::builder().user_agent(USER_AGENT).connect_timeout(Duration::from_secs(15)).build()?;
         let base = r.base_url();
         let actions = if push { "pull,push" } else { "pull" };
         Ok(Arc::new(Self {
-            tokens: Tokens::new(api.clone(), base.clone(), hf_token),
+            tokens: Tokens::new(api.clone(), base.clone(), hf_token, r.gets_token()),
             api,
             download,
             scope: format!("repository:{}:{actions}", r.repo),
@@ -119,6 +117,15 @@ impl Registry {
             repo: r.repo.clone(),
             base,
         }))
+    }
+
+    /// The client for registry and token requests: it follows no redirect, so no credential does.
+    pub(crate) fn api_client() -> reqwest::Result<reqwest::Client> {
+        reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .user_agent(USER_AGENT)
+            .connect_timeout(Duration::from_secs(15))
+            .build()
     }
 
     fn url(&self, suffix: &str) -> String {

@@ -52,7 +52,8 @@ OCI layouts (`pull -o`, `push --from oci:<dir>`) are bind-mounted into the helpe
 directory must be shared with the VM, and writable for `pull -o`.
 
 The Hugging Face token goes on the helper's stdin, never on a command line, in its environment or in
-its logs.
+its logs. The helper sends it to cr.hf.co's token endpoint on the Hub, and to no other registry unless
+`HF_IMAGE_TOKEN_REGISTRIES` lists it.
 
 ## Requirements
 
@@ -76,6 +77,7 @@ its logs.
 | `HF_IMAGE_HELPER_IMAGE` | pinned for each version | the helper image |
 | `HF_IMAGE_CONTAINERD_ADDRESS` | from `docker info` | containerd's socket, on the daemon's host |
 | `HF_IMAGE_INSECURE_REGISTRIES` | | comma-separated `host:port` served over plain HTTP (loopback always is) |
+| `HF_IMAGE_TOKEN_REGISTRIES` | | comma-separated `host:port` that get the Hugging Face token besides cr.hf.co (dev registries), at an https token endpoint, or any for a plain-HTTP registry |
 | `HF_IMAGE_LOG` | `warn` | the helper's log filter (`RUST_LOG` syntax) |
 | `HF_XET_*` | | xet-core settings, passed to the helper |
 
